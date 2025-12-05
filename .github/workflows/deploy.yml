@@ -59,26 +59,26 @@ jobs:
         key: ${{ secrets.EC2_SSH_KEY }}
         envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_REGION,ECR_REGISTRY,ECR_REPOSITORY,GEMINI_API_KEY
         script: |
-          # 1. FIX: Add Snap path so AWS CLI works
+          # 1. FIX: Add Snap path
           export PATH=$PATH:/snap/bin
 
-          # 2. Export Env Vars for Docker Compose
-          export ECR_REGISTRY=${{ secrets.ECR_REGISTRY }}
-          export ECR_REPOSITORY=${{ secrets.ECR_REPOSITORY }}
-          export GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
+          # 2. Login to ECR
           export AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}
           export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
           export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
-
-          # 3. Login to ECR (Using full path to be safe, though export PATH above usually fixes it)
+          export ECR_REGISTRY=${{ secrets.ECR_REGISTRY }}
+          
           aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
 
-          # 4. Ensure Directory Structure Exists
+          # 3. GENERATE .env FILE (This fixes the missing key issue)
+          echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" > .env
+          echo "ECR_REGISTRY=${{ secrets.ECR_REGISTRY }}" >> .env
+          echo "ECR_REPOSITORY=${{ secrets.ECR_REPOSITORY }}" >> .env
+          
+          # 4. Ensure Directories
           mkdir -p oncobot_data/knowledge_base
           mkdir -p oncobot_data/chroma_db
 
-          # 5. Pull Latest Image
+          # 5. Pull & Restart (Force new container)
           docker compose pull
-
-          # 6. Restart Services
-          docker compose up -d
+          docker compose up -d --force-recreate
