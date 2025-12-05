@@ -1,0 +1,7 @@
+# Virtual Environment
+.venv/
+.env/
+
+# Other common OS and environment files
+__pycache__/
+*.pyc

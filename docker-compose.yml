@@ -1,0 +1,14 @@
+services:
+  oncobot:
+    # We use the ECR URI variable here
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+    container_name: oncobot-container
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      # Map the persistent folders on EC2 to the container
+      - ./oncobot_data/knowledge_base:/app/knowledge_base
+      - ./oncobot_data/chroma_db:/app/chroma_db
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
