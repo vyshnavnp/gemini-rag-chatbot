@@ -15,12 +15,16 @@ from langchain_core.messages import HumanMessage
 
 from updater import update_knowledge_base
 
-# --- Config ---
-try:
-    API_KEY = st.secrets["GEMINI_API_KEY"]
-except KeyError:
-    st.error("Missing GEMINI_API_KEY")
-    st.stop()
+# 1. Try getting the key from Docker/Environment Variable first
+API_KEY = os.getenv("GEMINI_API_KEY")
+
+# 2. If not found, look for local secrets.toml (Local Development)
+if not API_KEY:
+    try:
+        API_KEY = st.secrets["GEMINI_API_KEY"]
+    except (KeyError, FileNotFoundError):
+        st.error("Missing GEMINI_API_KEY. Set it as an Env Var or in secrets.toml")
+        st.stop()
 
 CHROMA_PATH = "chroma_db"
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
