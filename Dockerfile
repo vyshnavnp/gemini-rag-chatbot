@@ -13,8 +13,11 @@ COPY requirements.txt .
 # 3. Install Python Libs
 RUN pip install --no-cache-dir -r requirements.txt
 
+
 # 4. Copy Code
 COPY . .
+# 4b. Copy Streamlit secrets
+COPY .streamlit /app/.streamlit
 
 # 5. Run
 EXPOSE 8501

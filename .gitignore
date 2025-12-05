@@ -5,3 +5,6 @@
 # Other common OS and environment files
 __pycache__/
 *.pyc
+
+# Streamlit secrets file (MUST NOT be committed)
+.streamlit/secrets.toml
