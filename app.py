@@ -22,7 +22,7 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 if not API_KEY:
     try:
         API_KEY = st.secrets["GEMINI_API_KEY"]
-    except (KeyError, FileNotFoundError):
+    except Exception: # <--- CHANGED: Catch ALL errors (including StreamlitSecretNotFoundError)
         st.error("Missing GEMINI_API_KEY. Set it as an Env Var or in secrets.toml")
         st.stop()
 
