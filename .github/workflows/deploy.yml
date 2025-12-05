@@ -19,7 +19,7 @@ jobs:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION }}
-
+    
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v1
@@ -74,6 +74,10 @@ jobs:
           echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" > .env
           echo "ECR_REGISTRY=${{ secrets.ECR_REGISTRY }}" >> .env
           echo "ECR_REPOSITORY=${{ secrets.ECR_REPOSITORY }}" >> .env
+
+          # 3b. Create Streamlit secrets.toml
+          mkdir -p .streamlit
+          echo "GEMINI_API_KEY = \"${{ secrets.GEMINI_API_KEY }}\"" > .streamlit/secrets.toml
           
           # 4. Ensure Directories
           mkdir -p oncobot_data/knowledge_base
