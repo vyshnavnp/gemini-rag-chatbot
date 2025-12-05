@@ -60,27 +60,24 @@ jobs:
         # Note: We don't need to pass all these ENVs, but it doesn't hurt.
         envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_REGION,ECR_REGISTRY,ECR_REPOSITORY,GEMINI_API_KEY
         script: |
-          # 1. FIX: Ensure AWS CLI is in the path (Necessary if installed via snap/apt)
           export PATH=$PATH:/snap/bin
-          
-          # 2. Export Env Vars for Docker Compose & AWS Login
           export AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}
           export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
           export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
           export ECR_REGISTRY=${{ secrets.ECR_REGISTRY }}
-          
-          # 3. Login to ECR (So EC2 can pull the private image)
+
+          # 1. Login
           aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
 
-          # 4. GENERATE .env FILE (Allows docker-compose.yml to read the keys)
+          # 2. Update .env file
           echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" > .env
           echo "ECR_REGISTRY=${{ secrets.ECR_REGISTRY }}" >> .env
           echo "ECR_REPOSITORY=${{ secrets.ECR_REPOSITORY }}" >> .env
 
-          # 5. Ensure Directory Structure Exists
-          mkdir -p oncobot_data/knowledge_base
-          mkdir -p oncobot_data/chroma_db
+          # 3. NUKE THE OLD CONTAINER & IMAGE (Crucial Step)
+          docker compose down || true
+          docker system prune -a -f  # Deletes all unused images to force a fresh download
 
-          # 6. Pull Latest Image & Restart Services
+          # 4. Pull and Start
           docker compose pull
-          docker compose up -d --force-recreate
+          docker compose up -d
