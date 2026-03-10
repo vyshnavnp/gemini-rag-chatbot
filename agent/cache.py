@@ -161,6 +161,26 @@ def store_response(query: str, result: dict) -> None:
     if "analyze_medical_image" in result.get("tools_used", []):
         return
 
+    # Do not cache error/fallback/broken responses.
+    # These were generated when RAG was empty, the API was down, or the agent
+    # failed.  Caching them would poison future queries for hours/days.
+    response_lower = result["response"].lower()
+    _BAD_PHRASES = (
+        "could not generate a response",
+        "please try again",
+        "knowledge base is currently empty",
+        "background indexer runs every 30",
+        "no relevant oncology information found",
+        "api daily quota has been reached",
+        "agent encountered an error",
+    )
+    if any(phrase in response_lower for phrase in _BAD_PHRASES):
+        return
+    # Reject suspiciously short responses (< 60 chars) — real oncology
+    # answers always contain more substance than a one-liner error message.
+    if len(result["response"].strip()) < 60:
+        return
+
     try:
         collection = _get_collection()
         doc_id = _stable_id(query)
