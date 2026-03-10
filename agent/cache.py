@@ -173,6 +173,8 @@ def store_response(query: str, result: dict) -> None:
         "no relevant oncology information found",
         "api daily quota has been reached",
         "agent encountered an error",
+        "image analysis failed",
+        "diagram generation failed",
     )
     if any(phrase in response_lower for phrase in _BAD_PHRASES):
         return

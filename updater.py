@@ -24,14 +24,14 @@ EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 def load_metadata():
     try:
         if os.path.exists(METADATA_FILE):
-            with open(METADATA_FILE, 'r') as f:
+            with open(METADATA_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
         return {}
-    except:
+    except (json.JSONDecodeError, OSError):
         return {}
 
 def save_metadata(metadata):
-    with open(METADATA_FILE, 'w') as f:
+    with open(METADATA_FILE, 'w', encoding='utf-8') as f:
         json.dump(metadata, f, indent=4)
 
 def process_pdf(filepath):
@@ -60,8 +60,8 @@ def process_xml(filepath):
                 # Add explicit "Medical Context" metadata
                 text = f"Oncology Topic: {topic}\nQuestion: {q}\nAnswer: {a}"
                 documents.append(Document(page_content=text, metadata={"source": filepath}))
-    except:
-        pass
+    except (ET.ParseError, OSError) as e:
+        print(f"Error parsing XML {filepath}: {e}")
     return documents
 
 def update_knowledge_base():
@@ -92,7 +92,7 @@ def update_knowledge_base():
             db.add_documents(chunks)
             indexed_data[filepath] = os.path.getmtime(filepath)
 
-    db.persist()
+    # ChromaDB with PersistentClient auto-persists; no manual persist() needed.
     save_metadata(indexed_data)
     print("✅ Medical Database Updated.")
 

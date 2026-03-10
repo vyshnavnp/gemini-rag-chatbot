@@ -64,7 +64,7 @@ def evaluate_last_response(question: str, answer: str) -> dict:
     # -------------------------------------------------------------------------
     try:
         from tools.onco_tools import oncology_rag_search
-        raw_result = oncology_rag_search.invoke({"query": question, "top_k": 5})
+        raw_result = oncology_rag_search.invoke({"query": question})
         # oncology_rag_search returns a formatted string; treat it as one context chunk.
         # If the tool returns a list-of-dicts in future, adjust here.
         contexts = [str(raw_result)] if raw_result else ["No RAG context available."]

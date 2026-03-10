@@ -25,13 +25,19 @@ count = 0
 for result in client.results(search):
     # Sanitize filename
     safe_title = "".join([c for c in result.title if c.isalpha() or c.isdigit() or c==' ']).rstrip()
+    if not safe_title:
+        # Fallback for titles with no alphanumeric characters (e.g. non-Latin scripts)
+        safe_title = f"paper_{result.entry_id.split('/')[-1]}"
     filename = f"{safe_title}.pdf"
     filepath = os.path.join(DATA_PATH, filename)
     
     if not os.path.exists(filepath):
         print(f"⬇️ Downloading: {result.title}")
-        result.download_pdf(dirpath=DATA_PATH, filename=filename)
-        count += 1
+        try:
+            result.download_pdf(dirpath=DATA_PATH, filename=filename)
+            count += 1
+        except Exception as e:
+            print(f"⚠️  Failed to download {result.title}: {e}")
     else:
         print(f"✅ Exists: {result.title}")
 
