@@ -8,9 +8,13 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 # --- Config ---
-CHROMA_PATH = "chroma_db"
-DATA_PATH = "knowledge_base"
-METADATA_FILE = "index_metadata.json"
+# Paths are absolute so the script works correctly whether run as
+#   python updater.py              (from any directory)
+#   or from the APScheduler/thread inside the Streamlit process.
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+CHROMA_PATH = os.path.join(_PROJECT_ROOT, "chroma_db")
+DATA_PATH = os.path.join(_PROJECT_ROOT, "knowledge_base")
+METADATA_FILE = os.path.join(_PROJECT_ROOT, "index_metadata.json")
 # Must match _COLLECTION_NAME in tools/onco_tools.py so that the indexer and
 # retriever always read from and write to the same ChromaDB collection.
 COLLECTION_NAME = "langchain"

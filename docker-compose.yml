@@ -7,8 +7,15 @@ services:
     ports:
       - "8501:8501"
     volumes:
-      # Map the persistent folders on EC2 to the container
-      - ./oncobot_data/knowledge_base:/app/knowledge_base
+      # chroma_db is persisted across container restarts so we don't have to
+      # re-index from scratch every time.  It is NOT baked into the image
+      # (chroma_db/ is in .dockerignore); on first startup the background
+      # indexer reads knowledge_base/ (baked in via COPY . .) and populates
+      # this volume automatically.
       - ./oncobot_data/chroma_db:/app/chroma_db
+      # NOTE: knowledge_base/ is intentionally NOT mounted as a volume.
+      # The XML files are baked into the image via 'COPY . .' in the Dockerfile.
+      # Mounting a host directory here would shadow the baked-in files with an
+      # empty directory on a fresh EC2 host, causing RAG to stay empty forever.
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY}

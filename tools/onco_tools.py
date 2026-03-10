@@ -19,7 +19,10 @@ from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 
 # These constants mirror what is set in app.py so there is one source of truth.
-CHROMA_PATH = "chroma_db"
+# Paths are anchored to the project root via __file__ so the app works correctly
+# regardless of the working directory (local dev vs Docker vs EC2).
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CHROMA_PATH = os.path.join(_PROJECT_ROOT, "chroma_db")
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 GENERATOR_MODEL = "gemini-3.1-flash-lite-preview"
 

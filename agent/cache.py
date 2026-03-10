@@ -33,7 +33,10 @@ from langchain_huggingface import HuggingFaceEmbeddings
 # Configuration
 # ---------------------------------------------------------------------------
 
-CHROMA_PATH = "chroma_db"
+# Anchor to project root via __file__ so the cache works regardless of CWD
+# (local dev launched from any directory, Docker WORKDIR /app, EC2, etc.).
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CHROMA_PATH = os.path.join(_PROJECT_ROOT, "chroma_db")
 CACHE_COLLECTION = "response_cache"
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 

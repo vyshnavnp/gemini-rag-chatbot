@@ -5,5 +5,9 @@ __pycache__
 venv
 .git
 .DS_Store
-*.sqlite3
 *.log
+# Exclude the entire chroma_db directory from the image.
+# A fresh DB is always built at container startup by the background indexer
+# reading from /app/knowledge_base (which IS baked into the image).
+# The chroma_db volume in docker-compose.yml persists it across restarts.
+chroma_db/
