@@ -12,6 +12,8 @@ import os
 import base64
 from typing import Optional
 
+import torch  # Must be imported explicitly; transformers pipeline uses it in the calling namespace.
+
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
@@ -257,11 +259,19 @@ def get_sentiment_tone(text: str) -> str:
         - "NEGATIVE (score: 0.97) - Use empathetic tone. Acknowledge distress."
         - "POSITIVE (score: 0.88) - Use clinical/professional tone."
     """
-    pipe = _get_sentiment_pipe()
-    result = pipe(text[:512])[0]  # Truncate to 512 tokens, model limit.
-
-    label = result["label"]
-    score = result["score"]
+    try:
+        pipe = _get_sentiment_pipe()
+        result = pipe(text[:512])[0]  # Truncate to 512 tokens, model limit.
+        label = result["label"]
+        score = result["score"]
+    except Exception as exc:
+        # If the sentiment model fails (e.g., torch or model load issue),
+        # fall back to a neutral professional tone instead of raising and
+        # causing the agent to retry this tool repeatedly.
+        return (
+            f"UNKNOWN (sentiment unavailable: {exc}) - "
+            "Use a professional, empathetic tone as a safe default."
+        )
 
     if label == "NEGATIVE":
         return (
