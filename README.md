@@ -2,7 +2,7 @@
 
 OncoBot is a production-grade, containerized agentic AI system designed to assist cancer researchers, clinicians, and patients with oncology inquiries.
 
-It was originally built as a standard RAG chatbot and has been upgraded to a full **LangGraph ReAct agent** with multi-tool reasoning, conversational memory, live external data sources, and a multi-agent supervisor architecture.
+It was originally built as a standard RAG chatbot and has been upgraded to a full **LangGraph ReAct agent** with multi-tool reasoning, conversational memory, live external data sources, a semantic response cache, and a multi-agent supervisor architecture.
 
 Deployed on AWS EC2 via a fully automated GitHub Actions CI/CD pipeline.
 
@@ -15,17 +15,23 @@ Deployed on AWS EC2 via a fully automated GitHub Actions CI/CD pipeline.
 User query → ChromaDB retriever (k=4) → Prompt template → Gemini LLM → Response
 ```
 
-### v2 (current): LangGraph ReAct Agent
+### v2 (current): LangGraph ReAct Agent with semantic cache
 ```
-User query → Agent reasons → Decides which tools to call → Calls them → Synthesizes → Response
-              |
-              ├── get_sentiment_tone        (DistilBERT, local)
-              ├── oncology_rag_search       (ChromaDB vector store)
-              ├── fetch_pubmed_abstracts    (NCBI E-utilities API)
-              ├── search_clinical_trials    (ClinicalTrials.gov API v2)
-              ├── generate_pathway_diagram  (Gemini → Graphviz DOT)
-              ├── analyze_medical_image     (Gemini Vision)
-              └── summarize_arxiv_paper     (arXiv API)
+User query → Cache check (ChromaDB cosine similarity >= 0.92) → Cache hit? → Return instantly
+                                    |
+                               Cache miss
+                                    |
+              Agent reasons → Decides which tools to call → Calls them → Synthesizes → Response
+              |                                                                  |
+              ├── get_sentiment_tone        (DistilBERT, local)                 |
+              ├── oncology_rag_search       (ChromaDB vector store)             |
+              ├── fetch_pubmed_abstracts    (NCBI E-utilities API)              |
+              ├── search_clinical_trials    (ClinicalTrials.gov API v2)         |
+              ├── generate_pathway_diagram  (Gemini → Graphviz DOT)            |
+              ├── analyze_medical_image     (Gemini Vision)                     |
+              └── summarize_arxiv_paper     (arXiv API)                         |
+                                                                                 |
+                                                              Store response in cache
 ```
 
 The agent runs a Thought → Action → Observation loop (ReAct pattern) until it has a complete answer. It uses `MemorySaver` checkpointing to maintain conversation history per session, so follow-up questions work without repeating context.
@@ -39,6 +45,12 @@ A **multi-agent supervisor** (`agent/supervisor.py`) is also implemented as an o
 **Agentic Reasoning**
 The LLM decides which tools to call and in what order based on the query. A factual question about cisplatin will trigger RAG search. "Latest research on CAR-T" will also trigger PubMed. "Are there trials for stage 4 lung cancer?" will trigger ClinicalTrials.gov. The agent chains these calls as needed.
 
+**Semantic Response Cache**
+Responses to previous queries are stored in a dedicated ChromaDB collection using the same embedding model as the RAG retriever. On every new query, the cache is checked first. If a semantically similar query exists (cosine similarity >= 0.92), the stored answer is returned immediately — no API call, no quota consumed. Paraphrases like "side effects of cisplatin" and "cisplatin adverse effects" resolve to the same cache entry. Image analysis responses are excluded from the cache since they depend on visual content. The cache is visible and clearable from the sidebar.
+
+**Rate-limit Handling**
+The agent retries automatically on Gemini API 429 (quota exceeded) errors, honouring the `retry_delay` field returned by the API, with a 60-second cap per wait. If the quota is exhausted after all retries, the user receives a plain-English message explaining the limit rather than a raw stack trace.
+
 **Conversational Memory**
 Each browser session gets a unique thread ID. LangGraph's `MemorySaver` stores the full message history for that thread, so the agent can answer follow-up questions with context from earlier in the conversation.
 
@@ -48,10 +60,10 @@ Each browser session gets a unique thread ID. LangGraph's `MemorySaver` stores t
 - arXiv API: looks up specific papers by ID on demand.
 
 **Reasoning Transparency**
-The right panel of the UI shows a collapsible "Agent Reasoning" section that lists every tool call, its arguments, and the observation returned — so users can see exactly how the agent arrived at its answer.
+The right panel of the UI shows a collapsible "Agent Reasoning" section that lists every tool call, its arguments, and the observation returned — so users can see exactly how the agent arrived at its answer. Cache hits are labelled with their similarity score.
 
 **Sentiment-Aware Responses**
-DistilBERT classifies each query as distressed or clinical. The agent's system prompt instructs it to lead with empathy before information when distress is detected.
+DistilBERT classifies emotional queries as distressed. The agent calls `get_sentiment_tone` only when the query sounds personal or emotional (fear, worry, diagnosis news) — factual and research queries skip sentiment analysis entirely to avoid unnecessary tool calls.
 
 **Multilingual**
 The `paraphrase-multilingual-MiniLM-L12-v2` embedding model allows queries in any language to match against the English knowledge base. The LLM responds in the language the user wrote in.
@@ -71,11 +83,11 @@ APScheduler runs `updater.py` every 30 minutes in a background thread. It checks
 
 | Layer | Technology |
 |---|---|
-| LLM | Google Gemini 2.5 Flash |
+| LLM | Google Gemini 2.0 Flash (1500 req/day free tier) |
 | Agent Framework | LangGraph 0.2.x (ReAct + StateGraph) |
 | Orchestration | LangChain |
 | Embeddings | HuggingFace `paraphrase-multilingual-MiniLM-L12-v2` |
-| Vector DB | ChromaDB (persistent, Docker volume) |
+| Vector DB | ChromaDB (RAG + response cache, persistent Docker volume) |
 | Sentiment | Transformers DistilBERT |
 | External APIs | ClinicalTrials.gov, NCBI PubMed, arXiv |
 | App Framework | Streamlit |
@@ -94,6 +106,7 @@ gemini_rag_chatbot/
 │       └── deploy.yml          # GitHub Actions: build -> push ECR -> SSH deploy EC2
 ├── agent/
 │   ├── __init__.py
+│   ├── cache.py                # Semantic query-response cache (ChromaDB, cosine similarity)
 │   ├── memory.py               # MemorySaver checkpointer, thread-scoped session memory
 │   ├── onco_agent.py           # LangGraph ReAct agent (default)
 │   └── supervisor.py           # Multi-agent supervisor with specialist routing (optional)
@@ -188,7 +201,13 @@ from agent.supervisor import build_supervisor
 return build_supervisor()
 ```
 
-Everything else (UI, memory, tool output parsing) stays the same.
+Everything else (UI, memory, cache, and tool output parsing) stays the same.
+
+---
+
+## API Quota Notes
+
+The project uses `gemini-2.0-flash`, which has a free-tier allowance of 1500 requests/day (vs 20/day for gemini-2.5-flash). The semantic cache further reduces live API calls by serving repeated or paraphrased questions from local storage. On quota exhaustion, the agent retries with the API-suggested delay before surfacing a user-friendly error.
 
 ---
 
