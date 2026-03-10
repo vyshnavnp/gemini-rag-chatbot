@@ -15,24 +15,42 @@ Deployed on AWS EC2 via a fully automated GitHub Actions CI/CD pipeline.
 User query → ChromaDB retriever (k=4) → Prompt template → Gemini LLM → Response
 ```
 
-### v2 (current): LangGraph ReAct Agent with semantic cache
+### v2 (current): Two-model LangGraph pipeline with semantic cache
 ```
 User query → Cache check (ChromaDB cosine similarity >= 0.92) → Cache hit? → Return instantly
                                     |
                                Cache miss
                                     |
-              Agent reasons → Decides which tools to call → Calls them → Synthesizes → Response
-              |                                                                  |
-              ├── get_sentiment_tone        (DistilBERT, local)                 |
-              ├── oncology_rag_search       (ChromaDB vector store)             |
-              ├── fetch_pubmed_abstracts    (NCBI E-utilities API)              |
-              ├── search_clinical_trials    (ClinicalTrials.gov API v2)         |
-              ├── generate_pathway_diagram  (Gemini → Graphviz DOT)            |
-              ├── analyze_medical_image     (Gemini Vision)                     |
-              └── summarize_arxiv_paper     (arXiv API)                         |
-                                                                                 |
-                                                              Store response in cache
+         ┌─────────────── PLANNER (gemini-2.5-flash) ───────────────┐
+         │  Decides which tools to call. Loops until research done.  │
+         │                                                            │
+         │  ├── get_sentiment_tone        (DistilBERT, local)        │
+         │  ├── oncology_rag_search       (ChromaDB vector store)    │
+         │  ├── fetch_pubmed_abstracts    (NCBI E-utilities API)     │
+         │  ├── search_clinical_trials    (ClinicalTrials.gov API v2)│
+         │  ├── generate_pathway_diagram  (Gemini → Graphviz DOT)   │
+         │  ├── analyze_medical_image     (Gemini Vision)            │
+         │  └── summarize_arxiv_paper     (arXiv API)               │
+         └──────────────────────────────────────────────────────────┘
+                                    |
+                    Planner done (no more tool calls)
+                                    |
+         ┌────────── SUMMARIZER (gemini-3.1-flash-lite-preview) ─────┐
+         │  Reads full conversation + all tool results.               │
+         │  Writes the final clean user-facing answer.                │
+         │  Never calls tools → no thought_signature error.           │
+         └───────────────────────────────────────────────────────────┘
+                                    |
+                        Store response in cache
 ```
+
+Why two models? `gemini-3.1-flash-lite` has thinking mode enabled by default. When a
+thinking model calls tools, it generates internal thought tokens that require a
+`thought_signature` echoed back with each tool result. LangGraph's `ToolNode` does not
+handle this, causing a gRPC error. The fix: `gemini-2.5-flash` handles all tool calling
+(stable, no thought_signature issue), and `gemini-3.1-flash-lite` only synthesizes text
+(no tools bound → no error). This also leverages the higher free-tier quota of Flash Lite
+(500 RPD vs 20 RPD) for the synthesis-only step.
 
 The agent runs a Thought → Action → Observation loop (ReAct pattern) until it has a complete answer. It uses `MemorySaver` checkpointing to maintain conversation history per session, so follow-up questions work without repeating context.
 
@@ -83,8 +101,9 @@ APScheduler runs `updater.py` every 30 minutes in a background thread. It checks
 
 | Layer | Technology |
 |---|---|
-| LLM | Google Gemini 3.1 Flash Lite Preview (500 req/day free tier) |
-| Agent Framework | LangGraph 0.2.x (ReAct + StateGraph) |
+| LLM (Planner) | Google Gemini 2.5 Flash — tool calling (20 req/day free tier) |
+| LLM (Summarizer) | Google Gemini 3.1 Flash Lite Preview — synthesis only (500 req/day) |
+| Agent Framework | LangGraph 1.0.x (two-model pipeline, StateGraph) |
 | Orchestration | LangChain |
 | Embeddings | HuggingFace `paraphrase-multilingual-MiniLM-L12-v2` |
 | Vector DB | ChromaDB (RAG + response cache, persistent Docker volume) |
@@ -207,7 +226,9 @@ Everything else (UI, memory, cache, and tool output parsing) stays the same.
 
 ## API Quota Notes
 
-The project uses `gemini-3.1-flash-lite-preview`, which has a free-tier allowance of 500 requests/day. The semantic cache further reduces live API calls by serving repeated or paraphrased questions from local storage. On quota exhaustion, the agent retries with the API-suggested delay before surfacing a user-friendly error.
+The project uses `gemini-2.5-flash`. The free-tier limit is 20 requests/day, but the semantic cache serves repeated and paraphrased questions from local ChromaDB storage without consuming any quota, so in normal demo usage the limit is rarely reached. On quota exhaustion, the agent retries with the API-suggested delay before surfacing a user-friendly error.
+
+Note: newer preview models (e.g. `gemini-3.1-flash-lite-preview`) have higher free-tier quotas but trigger a `thought_signature` error when used with LangGraph ToolNode because their thinking mode requires echoing back thought tokens that the current LangChain gRPC transport does not support. `gemini-2.5-flash` does not exhibit this issue.
 
 ---
 

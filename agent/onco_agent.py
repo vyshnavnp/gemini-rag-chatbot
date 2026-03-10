@@ -35,7 +35,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict
 
 from tools.onco_tools import (
@@ -58,18 +58,19 @@ from agent.memory import get_checkpointer
 # restriction, tool usage guidelines, and safety disclaimer.
 # It is injected as the first message in every conversation.
 
-SYSTEM_PROMPT = """
-You are OncoBot, an AI assistant specialized exclusively in oncology and cancer medicine.
+PLANNER_PROMPT = """
+You are OncoBot's research planner, specialized exclusively in oncology and cancer medicine.
 
-Your role is to assist cancer patients, caregivers, and medical researchers with:
-- Understanding cancer types, stages, and symptoms
-- Explaining treatment options: chemotherapy, immunotherapy, radiation, targeted therapy, surgery
-- Describing drug mechanisms, side effects, and interactions
-- Summarizing clinical trial opportunities
-- Explaining biological pathways and tumor biology
-- Providing emotional support and clear explanations when users are distressed
+Your ONLY job is to gather information by calling tools. You do NOT write the final answer
+to the user — a dedicated summarizer model will do that after you finish.
 
-You have access to the following tools. Use them in order of preference:
+Your role:
+- Decide which tools to call based on the user's query.
+- Call them in the right order.
+- Once you have enough information, output a brief internal research summary (2-3 sentences
+  max) that the summarizer can use. Do NOT write a full user-facing response.
+
+You have access to the following tools:
 
 1. get_sentiment_tone     - Call this ONLY when the query sounds emotional or personal
                             (mentions fear, worry, diagnosis news, prognosis, grief).
@@ -81,19 +82,31 @@ You have access to the following tools. Use them in order of preference:
 6. analyze_medical_image  - Use this only when an image has been provided by the user.
 7. summarize_arxiv_paper  - Use this when the user mentions a specific arXiv paper ID.
 
+Domain rule: if the question is completely unrelated to cancer or oncology, output
+"OUT_OF_DOMAIN" and nothing else.
+"""
+
+SUMMARIZER_PROMPT = """
+You are OncoBot, an AI assistant specialized in oncology and cancer medicine.
+You are the final step in a two-model pipeline. The planner model has already called
+all necessary tools and gathered the research. Your job is to write the final
+user-facing response based on the full conversation history and tool results above.
+
 Rules you must follow:
-- DOMAIN: If the question is not related to cancer, oncology, or closely related medicine,
-  politely decline and redirect the user to ask an oncology-related question.
-- CITATIONS: When you use oncology_rag_search, mention the source names in your response.
+- DOMAIN: If the planner indicated "OUT_OF_DOMAIN", politely decline and redirect
+  the user to ask an oncology-related question. Do not answer off-topic queries.
+- CITATIONS: If oncology_rag_search results are present in the context, mention
+  the source document names in your response.
 - SAFETY: Always end any medical information response with:
   "This information is provided for educational purposes only and is not a substitute
   for professional medical advice. Please consult your oncologist."
-- TONE: When a query sounds emotional or personal, call get_sentiment_tone first and adjust
-  your response accordingly. For clinical, research, or factual queries, use a professional
-  tone without calling get_sentiment_tone.
-- LANGUAGE: Always respond in the same language the user wrote in.
-- VISUALIZATION: If you generate a pathway diagram, return the DOT code wrapped in
-  triple backticks with the 'dot' language tag: ```dot ... ```
+- TONE: If the sentiment tool returned NEGATIVE, lead with empathy and acknowledgement
+  of the user's distress before providing medical information.
+- LANGUAGE: Respond in the same language the user wrote in.
+- VISUALIZATION: If a pathway diagram was generated, return the DOT code in your
+  response wrapped in triple backticks with the 'dot' language tag: ```dot ... ```
+- FORMAT: Write a clear, well-structured response. Use bullet points or numbered
+  lists where appropriate. Do not repeat the tool call logs — just the final answer.
 """
 
 
@@ -114,18 +127,32 @@ class AgentState(TypedDict):
 
 def build_agent():
     """
-    Build and compile the LangGraph ReAct agent graph.
+    Build and compile the two-model LangGraph agent graph.
 
-    This function should be called once at app startup (Streamlit caches it
-    with @st.cache_resource). Calling it multiple times is harmless but
-    wasteful since it loads the LLM and wires up the full state graph.
+    Architecture:
+        User query
+            ↓
+        planner_node  (gemini-2.5-flash, bound with all tools)
+            ↓  calls tools as needed, loops back after each tool result
+        tool_node     (LangGraph ToolNode executes the requested tool)
+            ↓  returns to planner_node with observation
+        planner_node  (decides: call more tools, or done?)
+            ↓  done (no more tool calls)
+        summarizer_node  (gemini-3.1-flash-lite-preview, NO tools)
+            ↓  reads full conversation + all tool results, writes final answer
+        END
 
-    The returned compiled graph has the same interface as a LangChain
-    runnable: call .invoke(input, config) or .stream(input, config).
+    Why two models:
+        - gemini-2.5-flash handles all tool-calling. Tool calling on Gemini 3.x
+          preview models triggers a thought_signature error because their
+          thinking mode generates internal tokens that the current LangChain
+          gRPC transport does not echo back correctly.
+        - gemini-3.1-flash-lite-preview never calls tools, so it has no
+          thought_signature issue, and its higher free-tier quota (500 RPD vs
+          20 RPD) applies to the synthesis step only.
 
     Returns:
-        A compiled LangGraph StateGraph (CompiledGraph object) with
-        MemorySaver-based checkpointing enabled.
+        A compiled LangGraph StateGraph with MemorySaver checkpointing.
 
     Raises:
         EnvironmentError: If GEMINI_API_KEY is not set.
@@ -137,15 +164,23 @@ def build_agent():
             "Set it as an environment variable or in .streamlit/secrets.toml"
         )
 
-    # The LLM needs to support tool calling. Gemini 2.5 Flash supports it.
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-3.1-flash-lite-preview",
+    # --- Model 1: Planner (gemini-2.5-flash) ---
+    # Handles all tool calls. Low temperature for deterministic tool selection.
+    planner_llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
         api_key=api_key,
-        temperature=0.3,   # Low temperature for factual medical responses.
+        temperature=0.2,
     )
 
-    # Register all tools with the LLM. This makes the LLM aware of what
-    # tools exist and what their arguments are (from the @tool docstrings).
+    # --- Model 2: Summarizer (gemini-3.1-flash-lite-preview) ---
+    # Only synthesizes text from tool results. Never calls tools.
+    # Slightly higher temperature for more natural prose.
+    summarizer_llm = ChatGoogleGenerativeAI(
+        model="gemini-3.1-flash-lite-preview",
+        api_key=api_key,
+        temperature=0.4,
+    )
+
     all_tools = [
         get_sentiment_tone,
         oncology_rag_search,
@@ -155,61 +190,70 @@ def build_agent():
         analyze_medical_image,
         summarize_arxiv_paper,
     ]
-    llm_with_tools = llm.bind_tools(all_tools)
+    planner_with_tools = planner_llm.bind_tools(all_tools)
 
-    # --- Node definitions ---
-
-    def agent_node(state: AgentState) -> dict:
+    # --- Node: planner ---
+    def planner_node(state: AgentState) -> dict:
         """
-        The agent node runs the LLM with the current message history.
-        It either produces a final text response or requests a tool call.
+        Runs gemini-2.5-flash with tools bound.
 
-        The system prompt is prepended to every call to ensure the LLM
-        always operates within its oncology domain constraints.
+        Reads the current conversation history and either:
+        - Returns an AIMessage with tool_calls (triggers the tool node), or
+        - Returns a plain AIMessage (research complete; triggers summarizer).
 
-        Args:
-            state: Current graph state containing the message history.
-
-        Returns:
-            A dict with 'messages' containing the LLM's response message.
-            If the LLM wants to call a tool, the response will be an
-            AIMessage with tool_calls populated.
+        The planner's final plain message is a brief internal summary of what
+        was found -- it is NOT shown to the user directly.
         """
-        messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
-        response = llm_with_tools.invoke(messages)
+        messages = [SystemMessage(content=PLANNER_PROMPT)] + state["messages"]
+        response = planner_with_tools.invoke(messages)
         return {"messages": [response]}
 
-    # ToolNode is a LangGraph prebuilt that:
-    # 1. Reads the tool_calls from the last AIMessage in state["messages"]
-    # 2. Executes each requested tool function with the given arguments
-    # 3. Returns ToolMessage(s) with the results
+    # --- Node: tools ---
+    # LangGraph prebuilt: reads tool_calls from the last AIMessage, executes
+    # the requested tool functions, and appends ToolMessage results to state.
     tool_node = ToolNode(tools=all_tools)
 
-    # --- Graph assembly ---
+    # --- Node: summarizer ---
+    def summarizer_node(state: AgentState) -> dict:
+        """
+        Runs gemini-3.1-flash-lite-preview WITHOUT any tools bound.
 
+        Receives the full message history (user query + all tool observations +
+        planner's research summary) and writes the final user-facing answer.
+
+        Because no tools are bound, this model never triggers a tool call and
+        therefore never encounters the thought_signature error.
+        """
+        messages = [SystemMessage(content=SUMMARIZER_PROMPT)] + state["messages"]
+        response = summarizer_llm.invoke(messages)
+        return {"messages": [response]}
+
+    # --- Routing condition ---
+    def route_planner(state: AgentState) -> str:
+        """
+        After the planner node runs, decide where to go next:
+          - If the last message has tool_calls  -> execute them ("tools")
+          - If the last message has no tool_calls -> research done ("summarizer")
+        """
+        last = state["messages"][-1]
+        if hasattr(last, "tool_calls") and last.tool_calls:
+            return "tools"
+        return "summarizer"
+
+    # --- Graph assembly ---
     graph = StateGraph(AgentState)
 
-    # Add the two nodes
-    graph.add_node("agent", agent_node)
+    graph.add_node("planner", planner_node)
     graph.add_node("tools", tool_node)
+    graph.add_node("summarizer", summarizer_node)
 
-    # The graph starts at the agent node
-    graph.add_edge(START, "agent")
+    graph.add_edge(START, "planner")
+    graph.add_conditional_edges("planner", route_planner)
+    graph.add_edge("tools", "planner")   # Tool results loop back to planner
+    graph.add_edge("summarizer", END)    # Summarizer output is always final
 
-    # After the agent node, use 'tools_condition' to decide:
-    #   - If the last message has tool_calls -> go to "tools"
-    #   - If not (final answer) -> go to END
-    graph.add_conditional_edges("agent", tools_condition)
-
-    # After tools run, always go back to the agent so it can reason
-    # about the tool output and either call more tools or give a final answer.
-    graph.add_edge("tools", "agent")
-
-    # Compile with memory checkpointing enabled.
     checkpointer = get_checkpointer()
-    compiled_graph = graph.compile(checkpointer=checkpointer)
-
-    return compiled_graph
+    return graph.compile(checkpointer=checkpointer)
 
 
 def run_agent(agent_graph, user_message: str, thread_id: str, image_b64: str = None) -> dict:
@@ -299,44 +343,78 @@ def run_agent(agent_graph, user_message: str, thread_id: str, image_b64: str = N
 
     # --- Parse the output ---
     # Walk through all messages produced in this turn to extract:
-    # - The final text response (last AIMessage with no tool_calls)
-    # - Any DOT diagram code
+    # - The final text response (the summarizer's message — always the last AIMessage
+    #   without tool_calls, produced by gemini-3.1-flash-lite-preview)
+    # - Any DOT diagram code embedded in the summarizer's response
     # - Reasoning steps for the transparency panel
-    # - Which tools were called
+    # - Which tools were called by the planner
+    #
+    # Message ordering in the final state:
+    #   HumanMessage (user query)
+    #   AIMessage with tool_calls  (planner calls tools)  ← labelled "planner"
+    #   ToolMessage(s)             (tool results)          ← labelled "observation"
+    #   ... (more planner + tool rounds as needed) ...
+    #   AIMessage without tool_calls (planner research summary) ← labelled "planner_summary"
+    #   AIMessage without tool_calls (summarizer final answer)  ← this becomes response_text
 
     response_text = ""
     graph_dot = None
     steps = []
     tools_used = []
 
+    # Collect all AIMessages without tool_calls in order. The second-to-last is
+    # the planner's research summary; the last is the summarizer's final answer.
+    plain_ai_messages = []
+
     for msg in final_state["messages"]:
         if isinstance(msg, AIMessage):
-            # If this AIMessage has tool calls, it is a "thinking" step.
             if msg.tool_calls:
+                # Planner is calling tools — record each call for the UI panel.
                 for tc in msg.tool_calls:
                     tool_name = tc["name"]
-                    tool_args = tc["args"]
                     tools_used.append(tool_name)
                     steps.append({
                         "type": "tool_call",
-                        "content": f"Calling tool: {tool_name}\nArguments: {tool_args}"
+                        "content": f"Calling tool: {tool_name}\nArguments: {tc['args']}"
                     })
             else:
-                # This is the final response.
-                raw = msg.content if isinstance(msg.content, str) else str(msg.content)
-                steps.append({
-                    "type": "final_answer",
-                    "content": raw[:200] + "..." if len(raw) > 200 else raw
-                })
-                response_text = raw
+                plain_ai_messages.append(msg)
 
         elif isinstance(msg, ToolMessage):
-            # Record the tool's output as an observation step.
             tool_output = msg.content[:300] + "..." if len(msg.content) > 300 else msg.content
             steps.append({
                 "type": "observation",
                 "content": f"Tool '{msg.name}' returned:\n{tool_output}"
             })
+
+    # Post-loop: extract planner research summary and summarizer final answer.
+    # plain_ai_messages list (AIMessages without tool_calls), in order:
+    #   [-2]  = planner's internal research summary (shown in transparency panel)
+    #   [-1]  = summarizer's final user-facing answer  (shown in chat)
+    if len(plain_ai_messages) >= 2:
+        planner_raw = plain_ai_messages[-2].content
+        if not isinstance(planner_raw, str):
+            planner_raw = " ".join(
+                p.get("text", "") for p in planner_raw if isinstance(p, dict)
+            )
+        steps.append({
+            "type": "planner_summary",
+            "content": (planner_raw[:200] + "...") if len(planner_raw) > 200 else planner_raw,
+        })
+
+    if plain_ai_messages:
+        last_content = plain_ai_messages[-1].content
+        response_text = (
+            last_content
+            if isinstance(last_content, str)
+            else " ".join(p.get("text", "") for p in last_content if isinstance(p, dict))
+        )
+        steps.append({
+            "type": "final_answer",
+            "content": (response_text[:200] + "...") if len(response_text) > 200 else response_text,
+        })
+    else:
+        response_text = "I'm sorry, I could not generate a response. Please try again."
 
     # Extract DOT diagram code if the response contains a ```dot block.
     if "```dot" in response_text:

@@ -323,7 +323,7 @@ def build_supervisor():
     # Use a slightly higher temperature for the support agent's empathetic
     # responses, but keep it factual for research and clinical.
     base_llm = ChatGoogleGenerativeAI(
-        model="gemini-3.1-flash-lite-preview",
+        model="gemini-2.5-flash",
         api_key=api_key,
         temperature=0.3,
     )

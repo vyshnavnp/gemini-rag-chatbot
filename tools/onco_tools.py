@@ -24,7 +24,7 @@ from transformers import pipeline
 # These constants mirror what is set in app.py so there is one source of truth.
 CHROMA_PATH = "chroma_db"
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-GENERATOR_MODEL = "gemini-3.1-flash-lite-preview"
+GENERATOR_MODEL = "gemini-2.5-flash"
 
 # ---------------------------------------------------------------------------
 # Module-level singletons
