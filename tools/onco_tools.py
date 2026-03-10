@@ -12,19 +12,16 @@ import os
 import base64
 from typing import Optional
 
-import torch  # Must be imported explicitly; transformers pipeline uses it in the calling namespace.
-
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
-from transformers import pipeline
 
 # These constants mirror what is set in app.py so there is one source of truth.
 CHROMA_PATH = "chroma_db"
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-GENERATOR_MODEL = "gemini-2.5-flash"
+GENERATOR_MODEL = "gemini-3.1-flash-lite-preview"
 
 # ---------------------------------------------------------------------------
 # Module-level singletons
@@ -34,7 +31,6 @@ GENERATOR_MODEL = "gemini-2.5-flash"
 # time would be very slow, so we cache them at the module level instead.
 # ---------------------------------------------------------------------------
 _retriever = None
-_sentiment_pipe = None
 
 
 def _get_retriever():
@@ -55,17 +51,6 @@ def _get_retriever():
         # The agent can decide how much of that context to use.
         _retriever = vector_store.as_retriever(search_kwargs={"k": 6})
     return _retriever
-
-
-def _get_sentiment_pipe():
-    """Load the DistilBERT sentiment pipeline once and reuse it."""
-    global _sentiment_pipe
-    if _sentiment_pipe is None:
-        _sentiment_pipe = pipeline(
-            "sentiment-analysis",
-            model="distilbert-base-uncased-finetuned-sst-2-english"
-        )
-    return _sentiment_pipe
 
 
 # ---------------------------------------------------------------------------
@@ -235,54 +220,4 @@ Topic: {topic}
         return f"Diagram generation failed: {str(e)}"
 
 
-# ---------------------------------------------------------------------------
-# Tool 4: Sentiment Tone Analysis
-# ---------------------------------------------------------------------------
 
-@tool
-def get_sentiment_tone(text: str) -> str:
-    """
-    Analyze the emotional tone of the user's message to determine whether
-    the response should use an empathetic or clinical/professional tone.
-
-    Use this tool at the start of any conversation turn to understand the
-    user's emotional state before crafting a response -- especially if the
-    query contains words suggesting fear, worry, diagnosis, or personal
-    medical situations.
-
-    Args:
-        text: The user's raw query text.
-
-    Returns:
-        A short string describing the detected tone and how the response
-        should be adjusted. Examples:
-        - "NEGATIVE (score: 0.97) - Use empathetic tone. Acknowledge distress."
-        - "POSITIVE (score: 0.88) - Use clinical/professional tone."
-    """
-    try:
-        pipe = _get_sentiment_pipe()
-        result = pipe(text[:512])[0]  # Truncate to 512 tokens, model limit.
-        label = result["label"]
-        score = result["score"]
-    except Exception as exc:
-        # If the sentiment model fails (e.g., torch or model load issue),
-        # fall back to a neutral professional tone instead of raising and
-        # causing the agent to retry this tool repeatedly.
-        return (
-            f"UNKNOWN (sentiment unavailable: {exc}) - "
-            "Use a professional, empathetic tone as a safe default."
-        )
-
-    if label == "NEGATIVE":
-        return (
-            f"NEGATIVE (score: {score:.2f}) - "
-            "User appears distressed or worried. "
-            "Use an empathetic and reassuring tone. "
-            "Acknowledge that this is difficult before giving medical information."
-        )
-    else:
-        return (
-            f"POSITIVE (score: {score:.2f}) - "
-            "User appears calm or is asking in a clinical/research context. "
-            "Use a precise, professional, objective tone."
-        )

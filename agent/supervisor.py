@@ -1,52 +1,42 @@
 # agent/supervisor.py
 #
-# Multi-agent supervisor using LangGraph.
+# Full 5-role multi-agent system built on LangGraph.
 #
-# Architecture:
-#   The supervisor is a router LLM that reads the user query and decides
-#   which specialist agent should handle it. Each specialist is a sub-graph
-#   that carries its own tool set and system prompt.
+# Roles:
+#   1. PLANNER      - Decomposes the user query into an ordered task list
+#   2. COORDINATOR  - Routes tasks to the right specialist; declares FINISH
+#   3. TOOL-USERS   - Three specialists (research, clinical, support), each
+#                     with their own tool set and system prompt
+#   4. EXECUTOR     - Manual tool loop inside each specialist (no ToolNode,
+#                     avoids thought_signature issues with Gemini 3.x models)
+#   5. CRITIC       - Reviews the final answer for safety, accuracy, citations
 #
-#   Supervisor
-#       |
-#       +-- research_agent   (RAG search + PubMed + arXiv) 
-#       |                     Best for: factual questions, paper lookups
-#       |
-#       +-- clinical_agent   (ClinicalTrials.gov + treatment info)
-#       |                     Best for: trial searches, treatment options
-#       |
-#       +-- support_agent    (Sentiment + empathetic responses)
-#                             Best for: distressed patients, general patient questions
+# Graph flow:
+#   START → planner → coordinator → specialist → coordinator (loop)
+#                                 → FINISH → critic
+#                                            → END            (approved)
+#                                            → coordinator    (revise, max 2x)
 #
-# How routing works:
-#   1. User message arrives at the supervisor node.
-#   2. The supervisor LLM reads the message and emits a routing decision:
-#      one of "research_agent", "clinical_agent", "support_agent", or "FINISH".
-#   3. The appropriate specialist sub-graph is invoked.
-#   4. The specialist's response is appended to the shared message state.
-#   5. Control returns to the supervisor, which decides if more work is needed
-#      or if the final answer is ready ("FINISH").
-#
-# NOTE: This module is available but is NOT used by default in app.py.
-# To switch from the single ReAct agent to the supervisor, change app.py to
-# call build_supervisor() instead of build_agent() in the load_agent()
-# function. Everything else stays the same because both return the same
-# LangGraph compiled graph interface.
+# Single model throughout: gemini-3.1-flash-lite-preview with thinking disabled.
+# thinking_mode DISABLED prevents the thought_signature gRPC error that would
+# otherwise crash when this model calls tools through LangChain.
+# Free tier quota: 500 requests/day (vs 20 RPD for gemini-2.5-flash).
 
 import os
-from typing import Annotated, Literal
+import re
+import time
+from typing import Annotated
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import SystemMessage, AIMessage, ToolMessage, HumanMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
 from typing_extensions import TypedDict
 
 from tools.onco_tools import (
     oncology_rag_search,
+    analyze_medical_image,
     generate_pathway_diagram,
-    get_sentiment_tone,
 )
 from tools.external_tools import (
     search_clinical_trials,
@@ -56,145 +46,202 @@ from tools.external_tools import (
 from agent.memory import get_checkpointer
 
 # ---------------------------------------------------------------------------
+# Single model constant shared across all 5 roles.
+# ---------------------------------------------------------------------------
+MODEL = "gemini-3.1-flash-lite-preview"
+THINKING_OFF = {"thinking_config": {"thinking_mode": "DISABLED"}}
+
+# ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
-# All agents share the same message list. The supervisor appends its routing
-# decision; specialists append their responses.
+# All five roles operate on the same shared state dict. LangGraph's
+# add_messages reducer appends new messages rather than overwriting.
 
-class SupervisorState(TypedDict):
-    messages: Annotated[list, add_messages]
-    # The name of the next agent to call, set by the supervisor node.
-    next_agent: str
+class OncoBotState(TypedDict):
+    messages: Annotated[list, add_messages]  # Full conversation history
+    next_agent: str       # Coordinator's routing decision
+    plan: str             # Planner's task decomposition (not in messages)
+    critic_feedback: str  # "APPROVED" or "REVISE: <reason>"
+    revision_count: int   # Guard against infinite critic→revise loops
 
 
 # ---------------------------------------------------------------------------
-# Specialist system prompts
+# Role 1: PLANNER prompt
+# ---------------------------------------------------------------------------
+
+PLANNER_PROMPT = """
+You are the OncoBot Planner. Analyze the user's query and produce a brief ordered
+task plan for the coordinator. Output ONLY the plan — nothing else.
+
+Available specialists:
+- research_agent: factual oncology information, PubMed searches, arXiv papers,
+  biological pathway diagrams
+- clinical_agent: clinical trials, treatment options, medical image analysis
+- support_agent: emotional or distressed patients, compassionate patient-facing responses
+
+Output format (use exactly this structure):
+1. <specialist_name>: <what to do>
+2. <specialist_name>: <what to do>   ← only include if a second specialist is needed
+
+If the query is completely unrelated to oncology or cancer medicine,
+output exactly: OUT_OF_DOMAIN
+"""
+
+# ---------------------------------------------------------------------------
+# Role 2: COORDINATOR prompt
+# ---------------------------------------------------------------------------
+
+COORDINATOR_PROMPT = """
+You are the OncoBot Coordinator. You read the task plan and the current conversation
+history, then route to the appropriate specialist or declare the work done.
+
+Task plan: {plan}
+Critic feedback: {critic_feedback}
+
+Rules:
+- Route one specialist at a time, following the plan order.
+- Once all planned tasks have specialist responses, output FINISH.
+- If critic feedback says REVISE, route to the specialist best able to fix the issue.
+- Never route the same specialist more than twice in one turn.
+- Respond with ONLY one of: research_agent, clinical_agent, support_agent, FINISH
+"""
+
+# ---------------------------------------------------------------------------
+# Role 3: Specialist system prompts (TOOL-USER role)
 # ---------------------------------------------------------------------------
 
 RESEARCH_AGENT_PROMPT = """
-You are the Research Specialist for OncoBot.
-Your job is to find and synthesize factual oncology information.
+You are the Research Specialist for OncoBot. Find and synthesize factual oncology
+information using your tools.
 
-You have access to:
-- oncology_rag_search: search the local knowledge base of medical QA pairs and papers
-- fetch_pubmed_abstracts: search PubMed for recent peer-reviewed research
-- summarize_arxiv_paper: look up a specific arXiv paper by ID
-- generate_pathway_diagram: create a biological pathway visualization
+Tools available:
+- oncology_rag_search: search the local knowledge base (MedQuAD + arXiv papers)
+- fetch_pubmed_abstracts: find recent peer-reviewed research on PubMed
+- summarize_arxiv_paper: retrieve a specific arXiv paper by ID
+- generate_pathway_diagram: create a biological pathway visualization in DOT format
 
-Use oncology_rag_search first. If the user asks for latest/recent research,
-also call fetch_pubmed_abstracts. Always cite your sources.
+Strategy:
+1. Always call oncology_rag_search first for factual questions.
+2. Also call fetch_pubmed_abstracts if the user asks for "latest" or "recent" research.
+3. Always cite the source filenames from the RAG results in your response.
+4. If a diagram is requested, call generate_pathway_diagram and wrap the output
+   in triple backticks with the 'dot' tag: ```dot ... ```
 """
 
 CLINICAL_AGENT_PROMPT = """
-You are the Clinical Specialist for OncoBot.
-Your job is to help users understand treatment options and find clinical trials.
+You are the Clinical Specialist for OncoBot. Help users understand treatments and trials.
 
-You have access to:
+Tools available:
 - search_clinical_trials: find recruiting trials on ClinicalTrials.gov
-- oncology_rag_search: search the local knowledge base for treatment information
-- generate_pathway_diagram: visualize treatment pathways if requested
+- oncology_rag_search: search the knowledge base for treatment information
+- analyze_medical_image: analyze an uploaded scan or pathology slide with Gemini Vision
+- generate_pathway_diagram: visualize treatment pathways
 
-When answering about treatments, always mention the standard of care first,
-then discuss experimental options. Always remind users to consult their oncologist.
+Strategy:
+1. For treatment questions: call oncology_rag_search first, then search_clinical_trials.
+2. For medical image questions: call analyze_medical_image with the question and image.
+3. Always mention standard of care before experimental options.
+4. Always remind users to consult their oncologist.
 """
 
 SUPPORT_AGENT_PROMPT = """
-You are the Patient Support Specialist for OncoBot.
-Your job is to provide compassionate, clear information to patients and caregivers
-who may be anxious, scared, or overwhelmed.
+You are the Patient Support Specialist for OncoBot. Provide compassionate, clear
+responses to patients and caregivers who may be anxious or overwhelmed.
 
-You have access to:
-- get_sentiment_tone: confirm the emotional state of the user
-- oncology_rag_search: find relevant patient-friendly information
+Tools available:
+- oncology_rag_search: find patient-friendly information
 - search_clinical_trials: help patients understand their options
 
-Lead with empathy. Use plain language, not medical jargon. Be reassuring.
-Acknowledge feelings before providing information.
+Strategy:
+1. ALWAYS lead with empathy. Acknowledge feelings before providing information.
+2. If the query contains words like "scared", "worried", "diagnosed", "afraid",
+   or describes a personal medical situation — open with warmth and compassion.
+3. Use plain language. Avoid heavy medical jargon.
+4. After empathetic acknowledgement, provide clear, helpful information.
+5. End with encouragement and a reminder that their medical team can best guide them.
 """
 
-SUPERVISOR_PROMPT = """
-You are the OncoBot supervisor. Your job is to read the user's query and route
-it to the most appropriate specialist agent.
+# ---------------------------------------------------------------------------
+# Role 5: CRITIC prompt
+# ---------------------------------------------------------------------------
 
-Available agents:
-- research_agent: Handles factual oncology questions, paper lookups, mechanism questions,
-  pathway visualizations, and anything requiring deep scientific information.
-- clinical_agent: Handles questions about treatments, clinical trials, chemotherapy
-  protocols, drug choices, and standard-of-care questions.
-- support_agent: Handles queries from distressed patients or caregivers, general
-  "I was diagnosed with..." questions, fear-based queries, and emotional support needs.
+CRITIC_PROMPT = """
+You are the OncoBot Critic. Review the most recent specialist response against
+these quality checks before it reaches the user.
 
-After a specialist has responded, check if the user's question is fully answered.
-If yes, respond with "FINISH". If the question needs input from another specialist,
-route to them. Do not route to the same specialist twice in one turn.
+Checks:
+1. SAFETY DISCLAIMER: Does it end with a note about "educational purposes only" and
+   advising the user to consult their oncologist?
+   (Required for any medical information response.)
+2. CITATIONS: If oncology_rag_search was called, are source filenames cited?
+3. TONE: If the original query was from a distressed patient, is the response empathetic?
+4. ACCURACY: Does the response actually address the user's question?
+5. COMPLETENESS: Are all parts of the user's question answered?
 
-Respond with ONLY the agent name to route to, or "FINISH". Nothing else.
+If ALL checks pass:
+  Output the final polished response for the user. You may lightly edit for clarity
+  and flow, but do not change factual content or remove citations/disclaimers.
+
+If ANY check fails:
+  Output EXACTLY: REVISE: <one sentence describing what is missing or wrong>
+  Nothing else.
 """
 
-
 # ---------------------------------------------------------------------------
-# Helper: build a specialist sub-graph
+# Role 4: EXECUTOR — specialist manual tool loop builder
 # ---------------------------------------------------------------------------
 
-def _build_specialist(
-    llm: ChatGoogleGenerativeAI,
-    tools: list,
-    system_prompt: str,
-    agent_name: str
-) -> callable:
+_MAX_TOOL_ITERATIONS = 5
+_MAX_RETRIES = 3
+
+
+def _build_specialist(llm, tools: list, system_prompt: str, agent_name: str):
     """
-    Build and return a single specialist agent as a callable function.
+    Build a specialist LangGraph node (combines Role 3 TOOL-USER + Role 4 EXECUTOR).
 
-    Rather than building a full sub-graph for each specialist (which would
-    add complexity), each specialist is a simple function that:
-    1. Binds its tool set to the LLM
-    2. Runs a mini ReAct loop (max 5 iterations to prevent infinite loops)
-    3. Returns the final response text
-
-    This function is used as a LangGraph node -- it receives the state dict
-    and returns an updated state dict.
+    Each specialist:
+      - Binds its own specific tool set to the LLM
+      - Runs a manual ReAct loop instead of using LangGraph's ToolNode
+        (avoids the thought_signature gRPC crash with Gemini 3.x models)
+      - Retries automatically on 429 rate-limit errors
+      - Appends all messages (tool calls, results, final answer) to shared state
 
     Args:
-        llm: The base LLM to use (tools will be bound to it).
-        tools: List of @tool functions this specialist can call.
-        system_prompt: The specialist's role and instructions.
-        agent_name: Display name used in step logs.
+        llm: The ChatGoogleGenerativeAI instance (tools will be bound to it).
+        tools: List of @tool-decorated functions available to this specialist.
+        system_prompt: The specialist's role, tools, and strategy instructions.
+        agent_name: Display name used in LangGraph traces and step logs.
 
     Returns:
-        A function with signature (state: SupervisorState) -> dict
-        that can be directly added as a LangGraph node.
+        A function (state: OncoBotState) -> dict suitable for graph.add_node().
     """
     llm_with_tools = llm.bind_tools(tools)
     tool_executor = {t.name: t for t in tools}
 
-    def specialist_node(state: SupervisorState) -> dict:
-        """
-        Run the specialist agent for one turn.
-
-        Executes a ReAct loop: the specialist LLM thinks and calls tools
-        until it produces a final text response or hits the iteration limit.
-
-        Args:
-            state: Current shared graph state.
-
-        Returns:
-            Dict with 'messages' containing the specialist's response(s).
-        """
+    def specialist_node(state: OncoBotState) -> dict:
         messages = [SystemMessage(content=system_prompt)] + state["messages"]
         new_messages = []
 
-        # Run the ReAct loop for a limited number of iterations.
-        max_iterations = 5
-        for _ in range(max_iterations):
-            response = llm_with_tools.invoke(messages + new_messages)
+        for _ in range(_MAX_TOOL_ITERATIONS):
+            # Invoke LLM with 429 retry (Role 4: Executor).
+            for attempt in range(_MAX_RETRIES):
+                try:
+                    response = llm_with_tools.invoke(messages + new_messages)
+                    break
+                except Exception as exc:
+                    if "429" in str(exc) and attempt < _MAX_RETRIES - 1:
+                        match = re.search(r"retry.*?(\d+)", str(exc), re.I)
+                        wait = int(match.group(1)) + 2 if match else (30 * (2 ** attempt))
+                        time.sleep(min(wait, 60))
+                        continue
+                    raise
+
             new_messages.append(response)
 
-            # If no tool calls, we have a final answer.
             if not response.tool_calls:
                 break
 
-            # Execute each requested tool.
-            from langchain_core.messages import ToolMessage
+            # Execute each tool call manually (Role 4: Executor).
             for tc in response.tool_calls:
                 tool_fn = tool_executor.get(tc["name"])
                 if tool_fn:
@@ -215,48 +262,49 @@ def _build_specialist(
 
         return {"messages": new_messages}
 
-    # Rename the function so LangGraph node names are meaningful in traces.
     specialist_node.__name__ = agent_name
     return specialist_node
 
 
 # ---------------------------------------------------------------------------
-# Supervisor node
+# Role 1: Planner node builder
 # ---------------------------------------------------------------------------
 
-def _build_supervisor_node(llm: ChatGoogleGenerativeAI) -> callable:
+def _build_planner_node(llm):
     """
-    Build the supervisor routing node.
+    Build the planner node (Role 1).
 
-    The supervisor reads all messages and emits a routing decision:
-    the name of the next specialist to call, or "FINISH".
-    The decision is written to state["next_agent"].
-
-    Args:
-        llm: The base LLM (no tools needed for the supervisor).
-
-    Returns:
-        A LangGraph node function.
+    Reads the user query and produces a task decomposition stored in
+    state['plan']. The plan is NOT added to state['messages'] so it
+    doesn't appear in the conversation history seen by specialists.
     """
-    def supervisor_node(state: SupervisorState) -> dict:
-        """
-        Decide which agent should handle the current state of the conversation.
+    def planner_node(state: OncoBotState) -> dict:
+        messages = [SystemMessage(content=PLANNER_PROMPT)] + state["messages"]
+        response = llm.invoke(messages)
+        return {"plan": response.content.strip()}
+    return planner_node
 
-        Reads the full message history and asks the supervisor LLM to choose
-        the next agent or declare "FINISH".
 
-        Args:
-            state: Current shared graph state.
+# ---------------------------------------------------------------------------
+# Role 2: Coordinator node builder + routing
+# ---------------------------------------------------------------------------
 
-        Returns:
-            Dict with 'next_agent' set to the routing decision.
-        """
-        messages = [SystemMessage(content=SUPERVISOR_PROMPT)] + state["messages"]
+def _build_coordinator_node(llm):
+    """
+    Build the coordinator node (Role 2).
+
+    Reads the task plan and conversation history, then routes to the
+    appropriate specialist or declares FINISH. The coordinator's routing
+    decision is stored in state['next_agent'] — not in messages.
+    """
+    def coordinator_node(state: OncoBotState) -> dict:
+        plan = state.get("plan", "")
+        critic_feedback = state.get("critic_feedback", "None")
+        prompt = COORDINATOR_PROMPT.format(plan=plan, critic_feedback=critic_feedback)
+        messages = [SystemMessage(content=prompt)] + state["messages"]
         response = llm.invoke(messages)
 
         decision = response.content.strip().lower()
-
-        # Normalize to valid agent names.
         if "research" in decision:
             next_agent = "research_agent"
         elif "clinical" in decision:
@@ -267,48 +315,80 @@ def _build_supervisor_node(llm: ChatGoogleGenerativeAI) -> callable:
             next_agent = "FINISH"
 
         return {"next_agent": next_agent}
+    return coordinator_node
 
-    return supervisor_node
 
-
-def _route_from_supervisor(state: SupervisorState) -> str:
+def _route_from_coordinator(state: OncoBotState) -> str:
     """
-    Conditional edge function that reads state["next_agent"] and returns
-    the name of the next graph node to go to.
-
-    LangGraph calls this function after the supervisor node runs to determine
-    which edge to follow.
-
-    Args:
-        state: Current graph state, with 'next_agent' set by supervisor node.
-
-    Returns:
-        The name of the next node: "research_agent", "clinical_agent",
-        "support_agent", or END.
+    Edge condition after the coordinator node.
+    Routes to a specialist name, or to "critic" when FINISH is declared.
     """
     next_agent = state.get("next_agent", "FINISH")
     if next_agent == "FINISH":
-        return END
+        return "critic"
     return next_agent
 
 
 # ---------------------------------------------------------------------------
-# Public builder function
+# Role 5: Critic node builder + routing
+# ---------------------------------------------------------------------------
+
+def _build_critic_node(llm):
+    """
+    Build the critic node (Role 5).
+
+    Reviews the latest specialist response. If all quality checks pass,
+    outputs the polished final answer (this becomes the response shown
+    to the user). If a check fails, outputs "REVISE: <reason>" which
+    routes back to the coordinator for a revision cycle (max 2 times).
+    """
+    def critic_node(state: OncoBotState) -> dict:
+        messages = [SystemMessage(content=CRITIC_PROMPT)] + state["messages"]
+        response = llm.invoke(messages)
+        content = response.content.strip()
+
+        if content.upper().startswith("REVISE"):
+            return {
+                "messages": [response],
+                "critic_feedback": content,
+                "revision_count": state.get("revision_count", 0) + 1,
+            }
+        else:
+            # Critic approved — its output IS the final user-facing answer.
+            return {
+                "messages": [response],
+                "critic_feedback": "APPROVED",
+            }
+    return critic_node
+
+
+def _route_from_critic(state: OncoBotState) -> str:
+    """
+    Edge condition after the critic node.
+    Sends back to coordinator for revision (up to 2 times) or ends the graph.
+    """
+    feedback = state.get("critic_feedback", "APPROVED")
+    revision_count = state.get("revision_count", 0)
+    if feedback.upper().startswith("REVISE") and revision_count < 2:
+        return "coordinator"
+    return END
+
+
+# ---------------------------------------------------------------------------
+# Public builder
 # ---------------------------------------------------------------------------
 
 def build_supervisor():
     """
-    Build and compile the multi-agent supervisor graph.
+    Build and compile the full 5-role multi-agent LangGraph graph.
 
-    This is an alternative to build_agent() in onco_agent.py.
-    Use this when you want routed specialist agents instead of a single
-    generalist agent. Swap it into app.py's load_agent() function.
-
-    The graph structure:
-        START -> supervisor -> research_agent -> supervisor -> ...
-                            -> clinical_agent -> supervisor -> ...
-                            -> support_agent  -> supervisor -> ...
-                            -> END
+    Graph structure:
+        START → planner → coordinator → research_agent  → coordinator (loop)
+                                      → clinical_agent  → coordinator (loop)
+                                      → support_agent   → coordinator (loop)
+                                      → (FINISH) → critic
+                                                   → END          (approved)
+                                                   → coordinator  (revise, max 2x)
 
     Returns:
         A compiled LangGraph StateGraph with MemorySaver checkpointing.
@@ -320,65 +400,216 @@ def build_supervisor():
     if not api_key:
         raise EnvironmentError("GEMINI_API_KEY is not set.")
 
-    # Use a slightly higher temperature for the support agent's empathetic
-    # responses, but keep it factual for research and clinical.
-    base_llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
+    llm = ChatGoogleGenerativeAI(
+        model=MODEL,
         api_key=api_key,
         temperature=0.3,
+        model_kwargs=THINKING_OFF,
     )
 
-    # Build specialist nodes
+    planner_node   = _build_planner_node(llm)
+    coordinator_node = _build_coordinator_node(llm)
+    critic_node    = _build_critic_node(llm)
+
     research_node = _build_specialist(
-        llm=base_llm,
+        llm=llm,
         tools=[oncology_rag_search, fetch_pubmed_abstracts, summarize_arxiv_paper, generate_pathway_diagram],
         system_prompt=RESEARCH_AGENT_PROMPT,
         agent_name="research_agent",
     )
-
     clinical_node = _build_specialist(
-        llm=base_llm,
-        tools=[search_clinical_trials, oncology_rag_search, generate_pathway_diagram],
+        llm=llm,
+        tools=[search_clinical_trials, oncology_rag_search, analyze_medical_image, generate_pathway_diagram],
         system_prompt=CLINICAL_AGENT_PROMPT,
         agent_name="clinical_agent",
     )
-
     support_node = _build_specialist(
-        llm=base_llm,
-        tools=[get_sentiment_tone, oncology_rag_search, search_clinical_trials],
+        llm=llm,
+        tools=[oncology_rag_search, search_clinical_trials],
         system_prompt=SUPPORT_AGENT_PROMPT,
         agent_name="support_agent",
     )
 
-    supervisor_node = _build_supervisor_node(base_llm)
+    graph = StateGraph(OncoBotState)
 
-    # Assemble the graph
-    graph = StateGraph(SupervisorState)
-
-    graph.add_node("supervisor", supervisor_node)
+    graph.add_node("planner",     planner_node)
+    graph.add_node("coordinator", coordinator_node)
     graph.add_node("research_agent", research_node)
     graph.add_node("clinical_agent", clinical_node)
-    graph.add_node("support_agent", support_node)
+    graph.add_node("support_agent",  support_node)
+    graph.add_node("critic",      critic_node)
 
-    # Start at the supervisor
-    graph.add_edge(START, "supervisor")
+    graph.add_edge(START, "planner")
+    graph.add_edge("planner", "coordinator")
 
-    # After supervisor, route conditionally based on next_agent
     graph.add_conditional_edges(
-        "supervisor",
-        _route_from_supervisor,
+        "coordinator",
+        _route_from_coordinator,
         {
             "research_agent": "research_agent",
             "clinical_agent": "clinical_agent",
             "support_agent": "support_agent",
+            "critic": "critic",
+        }
+    )
+
+    # Each specialist loops back to the coordinator after finishing.
+    graph.add_edge("research_agent", "coordinator")
+    graph.add_edge("clinical_agent", "coordinator")
+    graph.add_edge("support_agent",  "coordinator")
+
+    graph.add_conditional_edges(
+        "critic",
+        _route_from_critic,
+        {
+            "coordinator": "coordinator",
             END: END,
         }
     )
 
-    # After each specialist, go back to the supervisor to check if done
-    graph.add_edge("research_agent", "supervisor")
-    graph.add_edge("clinical_agent", "supervisor")
-    graph.add_edge("support_agent", "supervisor")
-
     checkpointer = get_checkpointer()
     return graph.compile(checkpointer=checkpointer)
+
+
+# ---------------------------------------------------------------------------
+# run_supervisor — invocation + output parsing
+# ---------------------------------------------------------------------------
+
+def run_supervisor(
+    agent_graph,
+    user_message: str,
+    thread_id: str,
+    image_b64: str = None,
+) -> dict:
+    """
+    Run one turn of the 5-role supervisor conversation.
+
+    Drop-in replacement for run_agent() in onco_agent.py — app.py calls
+    this with the same arguments and receives the same dict structure.
+
+    Args:
+        agent_graph: Compiled LangGraph graph from build_supervisor().
+        user_message: The user's text query.
+        thread_id: Session ID for MemorySaver continuity.
+        image_b64: Optional base64-encoded image string.
+
+    Returns:
+        Dict with keys: response, graph_dot, steps, tools_used, cache_hit.
+    """
+    from agent.memory import make_run_config
+    from agent.cache import get_cached_response, store_response
+
+    # Semantic cache check — skip all LLM calls if we have a similar answer.
+    if not image_b64:
+        cached = get_cached_response(user_message)
+        if cached is not None:
+            return cached
+
+    if image_b64:
+        input_message = HumanMessage(content=[
+            {"type": "text", "text": f"{user_message}\n\n[IMAGE_DATA_BASE64]: {image_b64}"}
+        ])
+    else:
+        input_message = HumanMessage(content=user_message)
+
+    config = make_run_config(thread_id)
+
+    # Invoke with top-level 429 retry (specialist nodes also retry internally).
+    MAX_RETRIES = 3
+    for attempt in range(MAX_RETRIES):
+        try:
+            final_state = agent_graph.invoke(
+                {
+                    "messages": [input_message],
+                    "plan": "",
+                    "next_agent": "",
+                    "critic_feedback": "",
+                    "revision_count": 0,
+                },
+                config=config,
+            )
+            break
+        except Exception as exc:
+            error_str = str(exc)
+            if "429" in error_str and attempt < MAX_RETRIES - 1:
+                match = re.search(r"retry.*?(\d+)\.?\d*\s*s", error_str, re.I)
+                wait = int(match.group(1)) + 2 if match else (30 * (2 ** attempt))
+                time.sleep(min(wait, 60))
+                continue
+            raise
+
+    # --- Parse output ---
+    # Walk all state messages to build:
+    #   response_text  — the critic's final approved answer (last AIMessage)
+    #   steps          — reasoning transparency panel entries
+    #   tools_used     — tool names for the badge strip
+    #   graph_dot      — Graphviz DOT code if any diagram was generated
+
+    response_text = ""
+    graph_dot = None
+    steps = []
+    tools_used = []
+
+    for msg in final_state["messages"]:
+        if isinstance(msg, AIMessage):
+            if msg.tool_calls:
+                # Specialist called a tool — record for the transparency panel.
+                for tc in msg.tool_calls:
+                    tools_used.append(tc["name"])
+                    steps.append({
+                        "type": "tool_call",
+                        "content": f"Calling tool: {tc['name']}\nArguments: {tc['args']}",
+                    })
+            else:
+                # Non-tool AIMessage: specialist final answer or critic output.
+                content = (
+                    msg.content
+                    if isinstance(msg.content, str)
+                    else " ".join(
+                        p.get("text", "") for p in msg.content if isinstance(p, dict)
+                    )
+                )
+                steps.append({
+                    "type": "agent_response",
+                    "content": (content[:200] + "...") if len(content) > 200 else content,
+                })
+                # Always update so the last one (critic's output) becomes the answer.
+                response_text = content
+
+        elif isinstance(msg, ToolMessage):
+            tool_output = msg.content[:300] + "..." if len(msg.content) > 300 else msg.content
+            steps.append({
+                "type": "observation",
+                "content": f"Tool '{msg.name}' returned:\n{tool_output}",
+            })
+
+    if not response_text:
+        response_text = "I'm sorry, I could not generate a response. Please try again."
+
+    # Extract DOT diagram code if embedded in the response.
+    if "```dot" in response_text:
+        parts = response_text.split("```dot")
+        response_text = parts[0].strip()
+        raw_dot = parts[1].split("```")[0].strip()
+        graph_dot = raw_dot
+
+    # Deduplicate tool names while preserving call order.
+    seen: set = set()
+    unique_tools = []
+    for t in tools_used:
+        if t not in seen:
+            seen.add(t)
+            unique_tools.append(t)
+
+    result = {
+        "response": response_text,
+        "graph_dot": graph_dot,
+        "steps": steps,
+        "tools_used": unique_tools,
+        "cache_hit": False,
+    }
+
+    if not image_b64:
+        store_response(user_message, result)
+
+    return result

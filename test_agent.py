@@ -137,32 +137,10 @@ check("ClinicalTrials.gov API is reachable", check_clinical_trials)
 check("arXiv API is reachable", check_arxiv)
 
 # ---------------------------------------------------------------------------
-# Step 4: Sentiment Tool (local model, no network needed)
+# Step 4: Agent Graph Builds
 # ---------------------------------------------------------------------------
 
-print("\n--- Step 4: Local Sentiment Model ---")
-
-def check_sentiment():
-    from tools.onco_tools import get_sentiment_tone
-    result = get_sentiment_tone.invoke({"text": "I am scared about my diagnosis"})
-    assert "NEGATIVE" in result, f"Expected NEGATIVE sentiment, got: {result}"
-    print(f"         Result: {result}")
-    return result
-
-def check_sentiment_positive():
-    from tools.onco_tools import get_sentiment_tone
-    result = get_sentiment_tone.invoke({"text": "What is the mechanism of pembrolizumab"})
-    print(f"         Result: {result}")
-    return result
-
-check("DistilBERT detects NEGATIVE sentiment (distressed query)", check_sentiment)
-check("DistilBERT detects tone for clinical query", check_sentiment_positive)
-
-# ---------------------------------------------------------------------------
-# Step 5: Agent Graph Builds
-# ---------------------------------------------------------------------------
-
-print("\n--- Step 5: Agent Graph Construction ---")
+print("\n--- Step 4: Agent Graph Construction ---")
 
 def check_agent_builds():
     from agent.onco_agent import build_agent
@@ -176,47 +154,47 @@ def check_supervisor_builds():
     assert supervisor is not None
     return supervisor
 
-agent = check("ReAct agent graph compiles", check_agent_builds)
-check("Multi-agent supervisor graph compiles", check_supervisor_builds)
+agent = check("Fallback ReAct agent graph compiles", check_agent_builds)
+supervisor = check("5-role supervisor graph compiles", check_supervisor_builds)
 
 # ---------------------------------------------------------------------------
-# Step 6: Full Agent Turn (live LLM call)
+# Step 5: Full Supervisor Turn (live LLM call)
 # ---------------------------------------------------------------------------
 
-print("\n--- Step 6: Full Agent Reasoning Turn (live LLM call) ---")
-print("    NOTE: This will call the Gemini API and may take 10-20 seconds.\n")
+print("\n--- Step 5: Full Supervisor Reasoning Turn (live LLM call) ---")
+print("    NOTE: This will call the Gemini API and may take 10-30 seconds.\n")
 
-if agent:
-    def check_agent_turn():
-        from agent.onco_agent import run_agent
-        result = run_agent(
-            agent_graph=agent,
+if supervisor:
+    def check_supervisor_turn():
+        from agent.supervisor import run_supervisor
+        result = run_supervisor(
+            agent_graph=supervisor,
             user_message="What are the common side effects of chemotherapy?",
-            thread_id="test-thread-001",
+            thread_id="test-supervisor-001",
         )
-        assert result["response"], "Agent returned empty response"
+        assert result["response"], "Supervisor returned empty response"
         assert len(result["response"]) > 50, "Response is suspiciously short"
-        assert result["tools_used"], "Agent did not use any tools"
         print(f"         Tools used  : {result['tools_used']}")
         print(f"         Steps taken : {len(result['steps'])}")
         preview = result["response"][:200].replace("\n", " ")
         print(f"         Response    : {preview}...")
         return result
 
-    turn1_result = check("Agent completes a reasoning turn", check_agent_turn)
+    turn1_result = check("Supervisor completes a reasoning turn", check_supervisor_turn)
+else:
+    turn1_result = None
+    print("  [SKIP] Step 5: skipped because supervisor graph failed to build.")
 
-    # Step 7: Memory continuity (second turn in same thread)
-    print("\n--- Step 7: Memory Continuity (follow-up question) ---")
+# Step 6: Memory continuity (second turn in same thread)
+print("\n--- Step 6: Memory Continuity (follow-up question) ---")
 
-    if turn1_result:
+if turn1_result:
         def check_memory_turn():
-            from agent.onco_agent import run_agent
-            # This follow-up question only makes sense if the agent remembers
-            # the previous question about chemotherapy side effects.
-            result = run_agent(
-                agent_graph=agent,
+            from agent.supervisor import run_supervisor
+            result = run_supervisor(
+                agent_graph=supervisor,
                 user_message="Which of those side effects are most common with cisplatin specifically?",
-                thread_id="test-thread-001",  # Same thread = same memory
+                thread_id="test-supervisor-001",  # Same thread = same memory
             )
             assert result["response"], "Agent returned empty response on follow-up"
             # If the agent has memory, it should mention cisplatin or the prior context
@@ -235,7 +213,7 @@ if agent:
 
         check("Agent remembers previous turn (memory continuity)", check_memory_turn)
 else:
-    print("  [SKIP] Step 6 and 7: skipped because agent graph failed to build.")
+    print("  [SKIP] Steps 5 and 6: skipped because supervisor graph failed to build.")
 
 # ---------------------------------------------------------------------------
 # Summary

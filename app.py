@@ -22,7 +22,7 @@ import base64
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from updater import update_knowledge_base
-from agent.onco_agent import build_agent, run_agent
+from agent.supervisor import build_supervisor, run_supervisor
 from agent.cache import cache_size, clear_cache
 
 # ---------------------------------------------------------------------------
@@ -58,15 +58,13 @@ CHROMA_PATH = "chroma_db"
 @st.cache_resource
 def load_agent():
     """
-    Load and compile the LangGraph ReAct agent.
+    Load and compile the 5-role multi-agent supervisor graph.
 
-    Returns the compiled agent graph, or None if the GEMINI_API_KEY is
-    missing (which is already handled above, but defensive check here).
-    The agent will fail later if the knowledge base is missing --
-    the oncology_rag_search tool returns a graceful error in that case.
+    Returns the compiled graph, or stops the app if the API key is missing.
+    The agents handle missing knowledge base gracefully via the RAG tool.
     """
     try:
-        return build_agent()
+        return build_supervisor()
     except EnvironmentError as e:
         st.error(str(e))
         st.stop()
@@ -215,7 +213,7 @@ with col_chat:
         with st.chat_message("assistant"):
             with st.spinner("Agent is reasoning..."):
                 try:
-                    result = run_agent(
+                    result = run_supervisor(
                         agent_graph=agent_graph,
                         user_message=prompt,
                         thread_id=st.session_state["thread_id"],
@@ -227,10 +225,10 @@ with col_chat:
                     if "429" in error_str or "quota" in error_str.lower():
                         user_msg = (
                             "The Gemini API daily quota has been reached. "
-                            "gemini-2.5-flash allows 20 requests/day on the free tier; "
-                            "with caching enabled most repeated queries use no quota.  "
-                            "Please wait a few minutes and try again, or upgrade to "
-                            "a paid API key at https://ai.dev/rate-limit."
+                            "gemini-3.1-flash-lite-preview allows 500 requests/day on the free "
+                            "tier; with caching enabled most repeated queries use no quota. "
+                            "Please wait a few minutes and try again, or upgrade to a paid "
+                            "API key at https://ai.dev/rate-limit."
                         )
                     else:
                         user_msg = f"Agent encountered an error: {error_str}"
