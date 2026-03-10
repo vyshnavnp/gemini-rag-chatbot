@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# 1. Install System Dependencies (Required for Graphviz & ChromeDB)
+# 1. Install System Dependencies (Required for Graphviz and ChromaDB)
 RUN apt-get update && apt-get install -y \
     graphviz \
     build-essential \
@@ -13,8 +13,10 @@ COPY requirements.txt .
 # 3. Install Python Libs
 RUN pip install --no-cache-dir -r requirements.txt
 
-
 # 4. Copy Code
+# The agent/ and tools/ subdirectories are included automatically.
+# Volumes in docker-compose.yml mount knowledge_base/ and chroma_db/
+# from the EC2 host, so those are NOT baked into the image.
 COPY . .
 
 # 5. Run

@@ -1,197 +1,285 @@
-# Force Update v2
+# app.py
+#
+# OncoBot - Agentic Oncology Research Assistant
+#
+# This is the main Streamlit application. It wires together:
+#   - The LangGraph ReAct agent (agent/onco_agent.py)
+#   - The background knowledge base updater (updater.py)
+#   - The Streamlit UI: chat, sidebar, visualization panel, reasoning panel
+#
+# What changed from v1:
+#   Before: user query -> retriever -> prompt -> LLM -> response (one shot, no reasoning)
+#   After:  user query -> agent reasons -> calls tools as needed -> synthesizes response
+#
+# The agent handles sentiment analysis, RAG search, PubMed, ClinicalTrials,
+# and image analysis as individual tool calls. The UI now shows which tools
+# were used and the agent's reasoning steps in a collapsible panel.
 
 import streamlit as st
 import os
+import uuid
 import base64
-from PIL import Image
 from apscheduler.schedulers.background import BackgroundScheduler
-from langdetect import detect
-from transformers import pipeline
-
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.messages import HumanMessage
 
 from updater import update_knowledge_base
+from agent.onco_agent import build_agent, run_agent
 
-# 1. Try getting the key from Docker/Environment Variable first
-API_KEY = os.getenv("GEMINI_API_KEY")
+# ---------------------------------------------------------------------------
+# API Key Setup
+# ---------------------------------------------------------------------------
+# Check environment variable first (Docker/EC2 sets this via docker-compose).
+# Fall back to .streamlit/secrets.toml for local development.
 
-# 2. If not found, look for local secrets.toml (Local Development)
-if not API_KEY:
+api_key = os.getenv("GEMINI_API_KEY")
+if not api_key:
     try:
-        API_KEY = st.secrets["GEMINI_API_KEY"]
-    except Exception: # <--- CHANGED: Catch ALL errors (including StreamlitSecretNotFoundError)
-        st.error("Missing GEMINI_API_KEY. Set it as an Env Var or in secrets.toml")
+        api_key = st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        st.error(
+            "GEMINI_API_KEY not found. "
+            "Set it as an environment variable or add it to .streamlit/secrets.toml"
+        )
         st.stop()
 
+# Set the key in the environment so the agent and tool modules can read it
+# with os.getenv() without needing to pass it around explicitly.
+os.environ["GEMINI_API_KEY"] = api_key
+
 CHROMA_PATH = "chroma_db"
-EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-GENERATOR_MODEL = "gemini-2.5-flash-preview-09-2025"
 
-# --- Initialization ---
+# ---------------------------------------------------------------------------
+# Cached resource: Agent
+# ---------------------------------------------------------------------------
+# build_agent() loads the LLM, registers all tools, and compiles the
+# LangGraph state machine. This is expensive so we cache it once per
+# Streamlit process using @st.cache_resource.
+
 @st.cache_resource
-def load_system():
-    # Task 5: Sentiment Analysis
-    sentiment_pipe = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
-    
-    # Task 1 & 6: Multilingual Vector Store
-    if not os.path.exists(CHROMA_PATH):
-        return None, None, None
-        
-    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-    vector_store = Chroma(persist_directory=CHROMA_PATH, embedding_function=embeddings)
-    retriever = vector_store.as_retriever(search_kwargs={"k": 4})
-    llm = ChatGoogleGenerativeAI(model=GENERATOR_MODEL, api_key=API_KEY)
-    
-    return sentiment_pipe, retriever, llm
+def load_agent():
+    """
+    Load and compile the LangGraph ReAct agent.
 
-# --- Background Updater ---
-if 'scheduler_started' not in st.session_state:
-    st.session_state['scheduler_started'] = False
+    Returns the compiled agent graph, or None if the GEMINI_API_KEY is
+    missing (which is already handled above, but defensive check here).
+    The agent will fail later if the knowledge base is missing --
+    the oncology_rag_search tool returns a graceful error in that case.
+    """
+    try:
+        return build_agent()
+    except EnvironmentError as e:
+        st.error(str(e))
+        st.stop()
 
-def start_scheduler():
-    if not st.session_state['scheduler_started']:
+# ---------------------------------------------------------------------------
+# Background Updater
+# ---------------------------------------------------------------------------
+# APScheduler runs update_knowledge_base() every 30 minutes in a background
+# thread. It checks file modification times (mtime) and only re-indexes
+# files that changed. This matches the behavior from the original app.
+
+def _start_scheduler():
+    """
+    Start the APScheduler background job to re-index the knowledge base
+    every 30 minutes. Guards against being started more than once in the
+    same Streamlit session.
+    """
+    if not st.session_state.get("scheduler_started", False):
         scheduler = BackgroundScheduler()
-        scheduler.add_job(update_knowledge_base, 'interval', minutes=30)
+        scheduler.add_job(update_knowledge_base, "interval", minutes=30)
         scheduler.start()
-        st.session_state['scheduler_started'] = True
+        st.session_state["scheduler_started"] = True
 
-# --- Main UI ---
-st.set_page_config(layout="wide", page_title="OncoBot AI", page_icon="🎗️")
+# ---------------------------------------------------------------------------
+# Page Config
+# ---------------------------------------------------------------------------
 
-st.title("🎗️ OncoBot: Intelligent Cancer Research Assistant")
-st.caption("Specialized in Oncology, Treatment Pathways, and Patient Support. (Not a replacement for a doctor).")
+st.set_page_config(
+    layout="wide",
+    page_title="OncoBot AI",
+    page_icon="ribbon"
+)
 
-start_scheduler()
-sentiment_pipe, retriever, llm = load_system()
+st.title("OncoBot: Intelligent Cancer Research Assistant")
+st.caption(
+    "Specialized in Oncology, Treatment Pathways, and Patient Support. "
+    "Not a replacement for a doctor."
+)
 
-if not retriever:
-    st.error("Knowledge Base is empty. Please run 'python updater.py' first.")
-    st.stop()
+# Run the scheduler and load the agent on every page load.
+# Both are guarded against re-initialization.
+_start_scheduler()
+agent_graph = load_agent()
 
-# --- Sidebar ---
-st.sidebar.header("Patient/Researcher Tools")
-uploaded_file = st.sidebar.file_uploader("Upload Scan/Diagram (Research Use Only)", type=["jpg", "png"])
+# ---------------------------------------------------------------------------
+# Session State Initialization
+# ---------------------------------------------------------------------------
+# Each browser session gets a unique thread_id. LangGraph uses this to
+# store and retrieve the conversation history from the MemorySaver checkpointer.
+# This means the agent remembers what was said earlier in the same session.
+
+if "thread_id" not in st.session_state:
+    st.session_state["thread_id"] = str(uuid.uuid4())
+
+if "messages" not in st.session_state:
+    # Chat history for the Streamlit UI display (role + content pairs).
+    st.session_state["messages"] = []
+
+if "last_graph_dot" not in st.session_state:
+    # Stores the most recent Graphviz DOT string for the visualization panel.
+    st.session_state["last_graph_dot"] = None
+
+if "last_reasoning_steps" not in st.session_state:
+    # Stores the agent's reasoning steps from the last turn for the
+    # transparency panel (collapsible expander in the right column).
+    st.session_state["last_reasoning_steps"] = []
+
+if "last_tools_used" not in st.session_state:
+    # List of tool names called in the last turn, shown as badges in the UI.
+    st.session_state["last_tools_used"] = []
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+
+st.sidebar.header("Patient / Researcher Tools")
+
+uploaded_file = st.sidebar.file_uploader(
+    "Upload Scan or Diagram (Research Use Only)",
+    type=["jpg", "jpeg", "png"]
+)
+
 if uploaded_file:
-    st.sidebar.image(uploaded_file, caption="Analyzing Visual Data...", use_container_width=True)
+    st.sidebar.image(
+        uploaded_file,
+        caption="Image will be analyzed by the agent.",
+        use_container_width=True
+    )
+    # Reset the file pointer after preview so we can read it again later.
     uploaded_file.seek(0)
 
 st.sidebar.markdown("---")
-lang_display = st.sidebar.empty()
-sent_display = st.sidebar.empty()
+st.sidebar.markdown("**Session ID**")
+st.sidebar.code(st.session_state["thread_id"][:8] + "...", language=None)
 
-# --- Logic ---
-col1, col2 = st.columns([3, 2]) # Wider chat, smaller graph
+st.sidebar.markdown("**Example prompts**")
+st.sidebar.markdown(
+    "- What are the side effects of pembrolizumab?\n"
+    "- Show clinical trials for stage 4 lung cancer\n"
+    "- Visualize the PD-1 checkpoint pathway\n"
+    "- Latest research on CAR-T cell therapy\n"
+    "- I am scared, I was just diagnosed with breast cancer"
+)
 
-with col1:
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+# ---------------------------------------------------------------------------
+# Main Layout: Chat (left) | Visualization + Reasoning (right)
+# ---------------------------------------------------------------------------
 
-    for msg in st.session_state.messages:
+col_chat, col_panel = st.columns([3, 2])
+
+# --- Left column: Chat ---
+with col_chat:
+    # Replay existing chat history on each render.
+    for msg in st.session_state["messages"]:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    if prompt := st.chat_input("Ask about immunotherapy, specific carcinomas, or side effects..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
+    # The main input box.
+    prompt = st.chat_input(
+        "Ask about immunotherapy, specific carcinomas, clinical trials, or side effects..."
+    )
+
+    if prompt:
+        # Show the user's message immediately.
+        st.session_state["messages"].append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
+        # Prepare the image for the agent if one was uploaded.
+        image_b64 = None
+        if uploaded_file:
+            image_bytes = uploaded_file.getvalue()
+            image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        # Run the agent.
         with st.chat_message("assistant"):
-            with st.spinner("Consulting Oncology Database..."):
-                response_text = ""
-                graph_code = None
-
-                # --- 1. Vision Mode ---
-                if uploaded_file:
-                    try:
-                        vision_llm = ChatGoogleGenerativeAI(model=GENERATOR_MODEL, api_key=API_KEY)
-                        image_bytes = uploaded_file.getvalue()
-                        b64 = base64.b64encode(image_bytes).decode()
-                        msg = HumanMessage(content=[
-                            {"type": "text", "text": f"Context: This is a medical image related to cancer/oncology. Question: {prompt}"},
-                            {"type": "image_url", "image_url": f"data:image/jpeg;base64,{b64}"}
-                        ])
-                        response_text = vision_llm.invoke([msg]).content
-                    except Exception as e:
-                        response_text = f"Error interpreting image: {e}"
-
-                # --- 2. Text Expert Mode ---
-                else:
-                    # A. Language Detection
-                    try:
-                        lang_code = detect(prompt)
-                    except:
-                        lang_code = "en"
-                    lang_display.info(f"🌐 Language: **{lang_code.upper()}**")
-
-                    # B. Sentiment Analysis
-                    sent_res = sentiment_pipe(prompt)[0]
-                    sentiment = sent_res['label']
-                    score = sent_res['score']
-                    
-                    if sentiment == "NEGATIVE":
-                        sent_display.error(f"❤️ Emotional Distress Detected ({score:.2f})")
-                        tone_prompt = "The user appears distressed or worried. Be extremely empathetic, reassuring, and gentle. Use phrases like 'I understand this is difficult'."
-                    else:
-                        sent_display.success(f"⚕️ Clinical Tone ({score:.2f})")
-                        tone_prompt = "Be professional, precise, and objective."
-
-                    # C. The "Curated" Prompt
-                    # UPDATED INSTRUCTION 3: FORCE VERTICAL LAYOUT
-                    template = f"""
-                    You are OncoBot, an AI specialized ONLY in Cancer and Oncology.
-                    
-                    USER METADATA:
-                    - Language: {lang_code}
-                    - Sentiment: {sentiment} ({tone_prompt})
-                    
-                    INSTRUCTIONS:
-                    1. DOMAIN CHECK: If the user asks about anything NOT related to cancer/biology, REFUSE politely.
-                    2. KNOWLEDGE: Use the provided Context to answer.
-                    3. VISUALIZATION: If user asks to "visualize", "map", or "show flow", generate a GRAPHVIZ DOT block (```dot ... ```). 
-                       CRITICAL: Inside the dot block, start with 'digraph G {{{{ rankdir=TB; ... }}}}' to ensure the graph is VERTICAL (Top-to-Bottom). Do NOT use Left-to-Right.
-                    4. ENTITIES: List "Key Medical Terms" found.
-                    5. SAFETY: Include disclaimer: "This is AI, not a doctor."
-                    6. OUTPUT: Answer in {lang_code}.
-
-                    CONTEXT:
-                    {{context}}
-
-                    QUESTION:
-                    {{question}}
-                    """
-
-                    rag_chain = (
-                        {"context": retriever, "question": RunnablePassthrough()}
-                        | ChatPromptTemplate.from_template(template)
-                        | llm
+            with st.spinner("Agent is reasoning..."):
+                try:
+                    result = run_agent(
+                        agent_graph=agent_graph,
+                        user_message=prompt,
+                        thread_id=st.session_state["thread_id"],
+                        image_b64=image_b64,
                     )
-                    
-                    full_response = rag_chain.invoke(prompt).content
-                    
-                    # D. Graph Extraction
-                    if "```dot" in full_response:
-                        parts = full_response.split("```dot")
-                        response_text = parts[0]
-                        graph_code = parts[1].split("```")[0]
-                    else:
-                        response_text = full_response
+                except Exception as e:
+                    # Surface any unhandled agent errors cleanly.
+                    result = {
+                        "response": f"Agent encountered an error: {str(e)}",
+                        "graph_dot": None,
+                        "steps": [],
+                        "tools_used": [],
+                    }
 
-                st.markdown(response_text)
-                if graph_code:
-                    st.session_state['last_graph'] = graph_code
-        
-        st.session_state.messages.append({"role": "assistant", "content": response_text})
+            response_text = result["response"]
+            st.markdown(response_text)
 
-with col2:
-    st.subheader("🧬 Biological Pathways")
-    if 'last_graph' in st.session_state:
-        # UPDATED: Added use_container_width=True to make it fill the column
-        st.graphviz_chart(st.session_state['last_graph'], use_container_width=True)
-        st.caption("Visual representation of the medical concept generated from the text.")
+            # Show which tools were called as small inline badges.
+            if result["tools_used"]:
+                tools_str = "  |  ".join(result["tools_used"])
+                st.caption(f"Tools used: {tools_str}")
+
+        # Save the assistant response to chat history.
+        st.session_state["messages"].append({
+            "role": "assistant",
+            "content": response_text
+        })
+
+        # Persist data for the right panel.
+        if result["graph_dot"]:
+            st.session_state["last_graph_dot"] = result["graph_dot"]
+        st.session_state["last_reasoning_steps"] = result["steps"]
+        st.session_state["last_tools_used"] = result["tools_used"]
+
+# --- Right column: Visualization + Reasoning Panel ---
+with col_panel:
+
+    # Section 1: Biological pathway diagram
+    st.subheader("Biological Pathways")
+    if st.session_state["last_graph_dot"]:
+        st.graphviz_chart(
+            st.session_state["last_graph_dot"],
+            use_container_width=True
+        )
+        st.caption("Diagram generated from the agent's response.")
     else:
-        st.info("Example commands:\n- 'Visualize the metastasis pathway'\n- 'Show a diagram of T-Cell activation'\n- 'Map the side effects of Chemotherapy'")
+        st.info(
+            "No diagram yet. Try asking:\n"
+            "- Visualize the metastasis pathway\n"
+            "- Show a diagram of T-cell activation\n"
+            "- Map the side effects of chemotherapy"
+        )
+
+    st.markdown("---")
+
+    # Section 2: Agent reasoning transparency
+    # This shows the user exactly how the agent arrived at its answer:
+    # which tools it called, what arguments it passed, and what they returned.
+    st.subheader("Agent Reasoning")
+    if st.session_state["last_reasoning_steps"]:
+        with st.expander("Show reasoning steps", expanded=False):
+            for i, step in enumerate(st.session_state["last_reasoning_steps"], start=1):
+                step_type = step["type"]
+                step_content = step["content"]
+
+                if step_type == "tool_call":
+                    st.markdown(f"**Step {i}: Tool Call**")
+                    st.code(step_content, language="text")
+                elif step_type == "observation":
+                    st.markdown(f"**Step {i}: Observation**")
+                    st.code(step_content, language="text")
+                elif step_type == "final_answer":
+                    st.markdown(f"**Step {i}: Final Answer (preview)**")
+                    st.code(step_content, language="text")
+
+                st.markdown("---")
+    else:
+        st.info("Agent reasoning steps will appear here after you send a message.")

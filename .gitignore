@@ -8,3 +8,12 @@ __pycache__/
 
 # Streamlit secrets file (MUST NOT be committed)
 .streamlit/secrets.toml
+
+# ChromaDB vector store
+# This is a binary SQLite database rebuilt by updater.py at runtime.
+# On EC2 it is mounted from ./oncobot_data/chroma_db via docker-compose volumes.
+# Never commit it -- it changes on every query and has no place in source control.
+chroma_db/
+
+# Local test artefacts
+index_metadata.json
