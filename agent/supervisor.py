@@ -50,6 +50,31 @@ from agent.memory import get_checkpointer
 # ---------------------------------------------------------------------------
 MODEL = "gemini-3.1-flash-lite-preview"
 THINKING_OFF = {"thinking_config": {"thinking_mode": "DISABLED"}}
+# Planner, Coordinator, and Critic do NOT call tools, so the thought_signature
+# gRPC issue cannot occur there.  We omit a thinking_config for those nodes,
+# letting the model use its native reasoning capability (effectively AUTO).
+# Only tool-using specialist nodes must keep thinking DISABLED.
+
+
+def _safe_content(content) -> str:
+    """
+    Safely extract a plain string from an AIMessage.content.
+
+    Gemini (and some other providers) return content as either a plain ``str``
+    or a list of typed parts, e.g. ``[{"type": "text", "text": "..."}]``.
+    Calling ``.strip()`` on the raw value crashes with
+    ``'list' object has no attribute 'strip'`` when the list form is returned.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict)
+        )
+    return str(content)
+
 
 # ---------------------------------------------------------------------------
 # Shared state
@@ -281,7 +306,7 @@ def _build_planner_node(llm):
     def planner_node(state: OncoBotState) -> dict:
         messages = [SystemMessage(content=PLANNER_PROMPT)] + state["messages"]
         response = llm.invoke(messages)
-        return {"plan": response.content.strip()}
+        return {"plan": _safe_content(response.content).strip()}
     return planner_node
 
 
@@ -304,7 +329,7 @@ def _build_coordinator_node(llm):
         messages = [SystemMessage(content=prompt)] + state["messages"]
         response = llm.invoke(messages)
 
-        decision = response.content.strip().lower()
+        decision = _safe_content(response.content).strip().lower()
         if "research" in decision:
             next_agent = "research_agent"
         elif "clinical" in decision:
@@ -345,7 +370,7 @@ def _build_critic_node(llm):
     def critic_node(state: OncoBotState) -> dict:
         messages = [SystemMessage(content=CRITIC_PROMPT)] + state["messages"]
         response = llm.invoke(messages)
-        content = response.content.strip()
+        content = _safe_content(response.content).strip()
 
         if content.upper().startswith("REVISE"):
             return {
@@ -400,31 +425,43 @@ def build_supervisor():
     if not api_key:
         raise EnvironmentError("GEMINI_API_KEY is not set.")
 
-    llm = ChatGoogleGenerativeAI(
+    # Thinking-capable LLM: Planner, Coordinator, Critic — no tools bound,
+    # so thought_signature is never echoed back and thinking is safe to use.
+    thinker_llm = ChatGoogleGenerativeAI(
+        model=MODEL,
+        api_key=api_key,
+        temperature=0.3,
+        # No thinking_config: model applies its native reasoning (AUTO).
+    )
+
+    # Tool-user LLM: specialists — thinking MUST be disabled to prevent the
+    # thought_signature gRPC crash that occurs when a thinking model issues
+    # tool calls through LangChain (LangChain does not echo the signature).
+    tool_llm = ChatGoogleGenerativeAI(
         model=MODEL,
         api_key=api_key,
         temperature=0.3,
         model_kwargs=THINKING_OFF,
     )
 
-    planner_node   = _build_planner_node(llm)
-    coordinator_node = _build_coordinator_node(llm)
-    critic_node    = _build_critic_node(llm)
+    planner_node     = _build_planner_node(thinker_llm)
+    coordinator_node = _build_coordinator_node(thinker_llm)
+    critic_node      = _build_critic_node(thinker_llm)
 
     research_node = _build_specialist(
-        llm=llm,
+        llm=tool_llm,
         tools=[oncology_rag_search, fetch_pubmed_abstracts, summarize_arxiv_paper, generate_pathway_diagram],
         system_prompt=RESEARCH_AGENT_PROMPT,
         agent_name="research_agent",
     )
     clinical_node = _build_specialist(
-        llm=llm,
+        llm=tool_llm,
         tools=[search_clinical_trials, oncology_rag_search, analyze_medical_image, generate_pathway_diagram],
         system_prompt=CLINICAL_AGENT_PROMPT,
         agent_name="clinical_agent",
     )
     support_node = _build_specialist(
-        llm=llm,
+        llm=tool_llm,
         tools=[oncology_rag_search, search_clinical_trials],
         system_prompt=SUPPORT_AGENT_PROMPT,
         agent_name="support_agent",
@@ -562,13 +599,7 @@ def run_supervisor(
                     })
             else:
                 # Non-tool AIMessage: specialist final answer or critic output.
-                content = (
-                    msg.content
-                    if isinstance(msg.content, str)
-                    else " ".join(
-                        p.get("text", "") for p in msg.content if isinstance(p, dict)
-                    )
-                )
+                content = _safe_content(msg.content)
                 steps.append({
                     "type": "agent_response",
                     "content": (content[:200] + "...") if len(content) > 200 else content,
@@ -613,3 +644,161 @@ def run_supervisor(
         store_response(user_message, result)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# stream_supervisor — streaming invocation for real-time Streamlit output
+# ---------------------------------------------------------------------------
+
+_STREAM_STATUS_LABELS = {
+    "planner":        "Analyzing query...",
+    "coordinator":    "Planning next step...",
+    "research_agent": "Searching oncology literature...",
+    "clinical_agent": "Checking clinical data...",
+    "support_agent":  "Preparing compassionate response...",
+    "critic":         "Reviewing response quality...",
+}
+
+
+def stream_supervisor(
+    agent_graph,
+    user_message: str,
+    thread_id: str,
+    image_b64: str = None,
+):
+    """
+    Stream one turn of the 5-role supervisor conversation.
+
+    Yields dicts with these shapes:
+      {"type": "status",  "content": str}
+          Progress label as each node activates (display as a status caption).
+      {"type": "token",   "content": str}
+          One token chunk from the critic's final output. Accumulate these to
+          build the full response_text.
+      {"type": "done",    "response": str, "graph_dot": str|None,
+                          "steps": list,   "tools_used": list,
+                          "cache_hit": bool}
+          Always the final event; carries full result metadata for panel updates.
+
+    For cache hits a single "done" event is yielded immediately (no tokens).
+    """
+    from agent.memory import make_run_config
+    from agent.cache import get_cached_response, store_response
+
+    # Semantic cache check — skip graph invocation if a similar answer exists.
+    if not image_b64:
+        cached = get_cached_response(user_message)
+        if cached is not None:
+            yield {"type": "done", **cached, "cache_hit": True}
+            return
+
+    if image_b64:
+        input_message = HumanMessage(content=[
+            {"type": "text", "text": f"{user_message}\n\n[IMAGE_DATA_BASE64]: {image_b64}"}
+        ])
+    else:
+        input_message = HumanMessage(content=user_message)
+
+    config = make_run_config(thread_id)
+
+    full_response = ""
+    graph_dot = None
+    steps: list = []
+    tools_used: list = []
+    status_shown: set = set()
+
+    try:
+        for chunk, metadata in agent_graph.stream(
+            {
+                "messages": [input_message],
+                "plan": "",
+                "next_agent": "",
+                "critic_feedback": "",
+                "revision_count": 0,
+            },
+            config=config,
+            stream_mode="messages",
+        ):
+            node = metadata.get("langgraph_node", "")
+
+            # Emit a progress label once per node activation.
+            if node and node not in status_shown:
+                status_shown.add(node)
+                label = _STREAM_STATUS_LABELS.get(node, f"{node} working...")
+                yield {"type": "status", "content": label}
+
+            # Track tool calls in the transparency panel.
+            if hasattr(chunk, "tool_calls") and chunk.tool_calls:
+                for tc in chunk.tool_calls:
+                    name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
+                    args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+                    if name:
+                        tools_used.append(name)
+                        steps.append({
+                            "type": "tool_call",
+                            "content": f"Calling tool: {name}\nArguments: {args}",
+                        })
+
+            # Track tool results in the transparency panel.
+            if isinstance(chunk, ToolMessage):
+                raw = _safe_content(chunk.content) if not isinstance(chunk.content, str) else chunk.content
+                tool_output = raw[:300] + "..." if len(raw) > 300 else raw
+                steps.append({
+                    "type": "observation",
+                    "content": f"Tool '{chunk.name}' returned:\n{tool_output}",
+                })
+
+            # Stream critic tokens directly to the user.
+            if node == "critic":
+                content = getattr(chunk, "content", None)
+                if content:
+                    text = _safe_content(content)
+                    if text:
+                        full_response += text
+                        yield {"type": "token", "content": text}
+
+    except Exception as exc:
+        error_str = str(exc)
+        if "429" in error_str or "quota" in error_str.lower():
+            msg = (
+                "The Gemini API daily quota has been reached. "
+                "gemini-3.1-flash-lite-preview allows 500 requests/day on the free "
+                "tier; with caching enabled most repeated queries use no quota. "
+                "Please wait a few minutes and try again."
+            )
+        else:
+            msg = f"Agent encountered an error: {error_str}"
+        full_response = msg
+        yield {"type": "token", "content": msg}
+
+    if not full_response:
+        full_response = "I'm sorry, I could not generate a response. Please try again."
+        yield {"type": "token", "content": full_response}
+
+    # Extract DOT diagram code if embedded in the critic's response.
+    if "```dot" in full_response:
+        parts = full_response.split("```dot")
+        full_response = parts[0].strip()
+        raw_dot = parts[1].split("```")[0].strip()
+        graph_dot = raw_dot
+
+    # Deduplicate tool names while preserving call order.
+    seen: set = set()
+    unique_tools: list = []
+    for t in tools_used:
+        if t not in seen:
+            seen.add(t)
+            unique_tools.append(t)
+
+    result = {
+        "response": full_response,
+        "graph_dot": graph_dot,
+        "steps": steps,
+        "tools_used": unique_tools,
+        "cache_hit": False,
+    }
+
+    if not image_b64:
+        store_response(user_message, result)
+
+    yield {"type": "done", **result}

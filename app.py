@@ -22,7 +22,7 @@ import base64
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from updater import update_knowledge_base
-from agent.supervisor import build_supervisor, run_supervisor
+from agent.supervisor import build_supervisor, run_supervisor, stream_supervisor
 from agent.cache import cache_size, clear_cache
 
 # ---------------------------------------------------------------------------
@@ -170,6 +170,32 @@ if st.sidebar.button("Clear response cache"):
     deleted = clear_cache()
     st.sidebar.success(f"Cleared {deleted} cached response(s).")
 
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Response Quality (RAGAS)**")
+st.sidebar.caption(
+    "Measures faithfulness and answer relevance against the RAG context. "
+    "Uses Gemini as an LLM judge — costs 1-2 extra API requests."
+)
+if st.sidebar.button("Evaluate last response"):
+    _msgs = st.session_state.get("messages", [])
+    _last_q = next((m["content"] for m in reversed(_msgs) if m["role"] == "user"), None)
+    _last_a = next((m["content"] for m in reversed(_msgs) if m["role"] == "assistant"), None)
+    if _last_q and _last_a:
+        with st.sidebar:
+            with st.spinner("Running RAGAS evaluation..."):
+                from evaluation.ragas_eval import evaluate_last_response
+                _scores = evaluate_last_response(_last_q, _last_a)
+        if "error" in _scores:
+            st.sidebar.warning(f"Evaluation failed: {_scores['error']}")
+        else:
+            for _metric, _score in _scores.items():
+                st.sidebar.metric(
+                    label=_metric.replace("_", " ").title(),
+                    value=f"{_score:.3f}",
+                )
+    else:
+        st.sidebar.info("Send a message first to enable evaluation.")
+
 st.sidebar.markdown("**Example prompts**")
 st.sidebar.markdown(
     "- What are the side effects of pembrolizumab?\n"
@@ -209,45 +235,51 @@ with col_chat:
             image_bytes = uploaded_file.getvalue()
             image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-        # Run the agent.
+        # Stream the agent response token-by-token so the UI feels fast.
         with st.chat_message("assistant"):
-            with st.spinner("Agent is reasoning..."):
-                try:
-                    result = run_supervisor(
-                        agent_graph=agent_graph,
-                        user_message=prompt,
-                        thread_id=st.session_state["thread_id"],
-                        image_b64=image_b64,
-                    )
-                except Exception as e:
-                    error_str = str(e)
-                    # Give a user-friendly message for quota/rate-limit errors.
-                    if "429" in error_str or "quota" in error_str.lower():
-                        user_msg = (
-                            "The Gemini API daily quota has been reached. "
-                            "gemini-3.1-flash-lite-preview allows 500 requests/day on the free "
-                            "tier; with caching enabled most repeated queries use no quota. "
-                            "Please wait a few minutes and try again, or upgrade to a paid "
-                            "API key at https://ai.dev/rate-limit."
-                        )
-                    else:
-                        user_msg = f"Agent encountered an error: {error_str}"
-                    result = {
-                        "response": user_msg,
-                        "graph_dot": None,
-                        "steps": [],
-                        "tools_used": [],
-                    }
+            response_placeholder = st.empty()
+            status_placeholder   = st.empty()
+            streamed_text = ""
+            final_result = {
+                "response": "",
+                "graph_dot": None,
+                "steps": [],
+                "tools_used": [],
+                "cache_hit": False,
+            }
 
-            response_text = result["response"]
-            st.markdown(response_text)
+            for _event in stream_supervisor(
+                agent_graph=agent_graph,
+                user_message=prompt,
+                thread_id=st.session_state["thread_id"],
+                image_b64=image_b64,
+            ):
+                if _event["type"] == "status":
+                    # Show which node is currently active.
+                    status_placeholder.caption(f"*{_event['content']}*")
+                elif _event["type"] == "token":
+                    # Append token and re-render with a blinking cursor effect.
+                    streamed_text += _event["content"]
+                    response_placeholder.markdown(streamed_text + " ▮")
+                elif _event["type"] == "done":
+                    final_result = _event
+                    status_placeholder.empty()
+
+            # Cache hits deliver the full response inside the 'done' event.
+            response_text = (
+                final_result["response"]
+                if final_result.get("cache_hit")
+                else streamed_text
+            )
+            # Final render without cursor.
+            response_placeholder.markdown(response_text)
 
             # Show cache hit notice or tools used as inline badges.
-            if result.get("cache_hit"):
-                similarity_pct = int(result.get("cache_similarity", 1.0) * 100)
+            if final_result.get("cache_hit"):
+                similarity_pct = int(final_result.get("cache_similarity", 1.0) * 100)
                 st.caption(f"Served from cache (similarity: {similarity_pct}%) — no API quota used.")
-            elif result["tools_used"]:
-                tools_str = "  |  ".join(result["tools_used"])
+            elif final_result.get("tools_used"):
+                tools_str = "  |  ".join(final_result["tools_used"])
                 st.caption(f"Tools used: {tools_str}")
 
         # Save the assistant response to chat history.
@@ -257,10 +289,10 @@ with col_chat:
         })
 
         # Persist data for the right panel.
-        if result["graph_dot"]:
-            st.session_state["last_graph_dot"] = result["graph_dot"]
-        st.session_state["last_reasoning_steps"] = result["steps"]
-        st.session_state["last_tools_used"] = result["tools_used"]
+        if final_result["graph_dot"]:
+            st.session_state["last_graph_dot"] = final_result["graph_dot"]
+        st.session_state["last_reasoning_steps"] = final_result["steps"]
+        st.session_state["last_tools_used"] = final_result["tools_used"]
 
 # --- Right column: Visualization + Reasoning Panel ---
 with col_panel:
