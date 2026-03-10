@@ -50,10 +50,13 @@ from agent.memory import get_checkpointer
 # ---------------------------------------------------------------------------
 MODEL = "gemini-3.1-flash-lite-preview"
 THINKING_OFF = {"thinking_config": {"thinking_mode": "DISABLED"}}
-# Planner, Coordinator, and Critic do NOT call tools, so the thought_signature
-# gRPC issue cannot occur there.  We omit a thinking_config for those nodes,
-# letting the model use its native reasoning capability (effectively AUTO).
-# Only tool-using specialist nodes must keep thinking DISABLED.
+# Thinking DISABLED only for tool-using specialist nodes.  Thinking AUTO
+# would cause the thought_signature gRPC crash when LangChain calls tools.
+#
+# Planner, Coordinator, and Critic do NOT call tools, so they safely use
+# thinking AUTO (the default) for better reasoning.  _safe_content() handles
+# the None / list-of-parts content format that thinking-mode produces, and
+# stream_mode="updates" reliably captures their output.
 
 
 def _safe_content(content) -> str:
@@ -64,7 +67,10 @@ def _safe_content(content) -> str:
     or a list of typed parts, e.g. ``[{"type": "text", "text": "..."}]``.
     Calling ``.strip()`` on the raw value crashes with
     ``'list' object has no attribute 'strip'`` when the list form is returned.
+    Also handles None (which thinking-mode models may return).
     """
+    if not content:
+        return ""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -425,18 +431,18 @@ def build_supervisor():
     if not api_key:
         raise EnvironmentError("GEMINI_API_KEY is not set.")
 
-    # Thinking-capable LLM: Planner, Coordinator, Critic — no tools bound,
-    # so thought_signature is never echoed back and thinking is safe to use.
+    # Thinking-capable LLM for Planner, Coordinator, Critic — no tools bound,
+    # so thought_signature is never echoed back and thinking is safe.
+    # _safe_content() handles the None / list-of-parts content format.
     thinker_llm = ChatGoogleGenerativeAI(
         model=MODEL,
         api_key=api_key,
         temperature=0.3,
-        # No thinking_config: model applies its native reasoning (AUTO).
+        # No thinking_config → model uses native reasoning (AUTO).
     )
 
-    # Tool-user LLM: specialists — thinking MUST be disabled to prevent the
-    # thought_signature gRPC crash that occurs when a thinking model issues
-    # tool calls through LangChain (LangChain does not echo the signature).
+    # Tool-user LLM for specialists — thinking MUST be disabled to prevent
+    # the thought_signature gRPC crash when calling tools via LangChain.
     tool_llm = ChatGoogleGenerativeAI(
         model=MODEL,
         api_key=api_key,
@@ -708,7 +714,13 @@ def stream_supervisor(
     status_shown: set = set()
 
     try:
-        for chunk, metadata in agent_graph.stream(
+        # Use stream_mode="updates" instead of "messages".
+        # "messages" relies on LangGraph intercepting llm.invoke() calls
+        # inside custom node closures for token streaming.  In LangGraph
+        # 1.0.x this interception is unreliable for closure-based nodes,
+        # causing the critic's response to be silently lost.
+        # "updates" reliably yields the state delta from every node.
+        for update in agent_graph.stream(
             {
                 "messages": [input_message],
                 "plan": "",
@@ -717,45 +729,46 @@ def stream_supervisor(
                 "revision_count": 0,
             },
             config=config,
-            stream_mode="messages",
+            stream_mode="updates",
         ):
-            node = metadata.get("langgraph_node", "")
+            for node_name, node_output in update.items():
+                # Emit a progress label once per node activation.
+                if node_name and node_name not in status_shown:
+                    status_shown.add(node_name)
+                    label = _STREAM_STATUS_LABELS.get(node_name, f"{node_name} working...")
+                    yield {"type": "status", "content": label}
 
-            # Emit a progress label once per node activation.
-            if node and node not in status_shown:
-                status_shown.add(node)
-                label = _STREAM_STATUS_LABELS.get(node, f"{node} working...")
-                yield {"type": "status", "content": label}
+                # Process messages produced by this node.
+                for msg in node_output.get("messages", []):
+                    # Track tool calls in the transparency panel.
+                    if hasattr(msg, "tool_calls") and msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
+                            args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+                            if name:
+                                tools_used.append(name)
+                                steps.append({
+                                    "type": "tool_call",
+                                    "content": f"Calling tool: {name}\nArguments: {args}",
+                                })
 
-            # Track tool calls in the transparency panel.
-            if hasattr(chunk, "tool_calls") and chunk.tool_calls:
-                for tc in chunk.tool_calls:
-                    name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
-                    args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
-                    if name:
-                        tools_used.append(name)
+                    # Track tool results in the transparency panel.
+                    if isinstance(msg, ToolMessage):
+                        raw = msg.content if isinstance(msg.content, str) else _safe_content(msg.content)
+                        tool_output = raw[:300] + "..." if len(raw) > 300 else raw
                         steps.append({
-                            "type": "tool_call",
-                            "content": f"Calling tool: {name}\nArguments: {args}",
+                            "type": "observation",
+                            "content": f"Tool '{msg.name}' returned:\n{tool_output}",
                         })
 
-            # Track tool results in the transparency panel.
-            if isinstance(chunk, ToolMessage):
-                raw = _safe_content(chunk.content) if not isinstance(chunk.content, str) else chunk.content
-                tool_output = raw[:300] + "..." if len(raw) > 300 else raw
-                steps.append({
-                    "type": "observation",
-                    "content": f"Tool '{chunk.name}' returned:\n{tool_output}",
-                })
-
-            # Stream critic tokens directly to the user.
-            if node == "critic":
-                content = getattr(chunk, "content", None)
-                if content:
-                    text = _safe_content(content)
-                    if text:
-                        full_response += text
-                        yield {"type": "token", "content": text}
+                # Capture the critic's final answer.
+                if node_name == "critic":
+                    for msg in node_output.get("messages", []):
+                        if isinstance(msg, AIMessage):
+                            text = _safe_content(msg.content).strip()
+                            if text and not text.upper().startswith("REVISE"):
+                                full_response = text
+                                yield {"type": "token", "content": text}
 
     except Exception as exc:
         error_str = str(exc)
@@ -770,6 +783,21 @@ def stream_supervisor(
             msg = f"Agent encountered an error: {error_str}"
         full_response = msg
         yield {"type": "token", "content": msg}
+
+    # Fallback: if streaming did not capture a response, read final state.
+    if not full_response:
+        try:
+            final_state = agent_graph.get_state(config)
+            if final_state and final_state.values:
+                for msg in reversed(final_state.values.get("messages", [])):
+                    if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
+                        text = _safe_content(msg.content).strip()
+                        if text and len(text) > 20:
+                            full_response = text
+                            yield {"type": "token", "content": text}
+                            break
+        except Exception:
+            pass
 
     if not full_response:
         full_response = "I'm sorry, I could not generate a response. Please try again."
