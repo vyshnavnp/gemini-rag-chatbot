@@ -25,32 +25,47 @@ GENERATOR_MODEL = "gemini-3.1-flash-lite-preview"
 
 # ---------------------------------------------------------------------------
 # Module-level singletons
-# These are loaded once per process. Streamlit's @st.cache_resource handles
-# caching at the app layer, but these tools are also called from inside the
-# agent which runs outside of the Streamlit resource cache. Lazy-loading each
-# time would be very slow, so we cache them at the module level instead.
+# Only the embedding model is cached — it takes ~2 s to load and never changes.
+# The Chroma vectorstore is intentionally NOT cached so that every tool call
+# opens a fresh connection to the SQLite backing store. This guarantees that
+# documents indexed by update_knowledge_base() in the background thread are
+# always visible, even if indexing happened after the first tool invocation.
 # ---------------------------------------------------------------------------
-_retriever = None
+_embed_model = None
+
+_COLLECTION_NAME = "langchain"  # Must match the name used in updater.py
+
+
+def _get_embed_model():
+    """Return (and lazily load) the HuggingFaceEmbeddings singleton."""
+    global _embed_model
+    if _embed_model is None:
+        _embed_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    return _embed_model
 
 
 def _get_retriever():
     """
-    Load the ChromaDB retriever once and reuse it.
+    Build a ChromaDB retriever fresh on each call.
+
+    Opening a new Chroma object is cheap (re-uses the on-disk SQLite); only
+    the embedding model load is expensive, and that is cached separately.
+    Always building fresh prevents stale in-memory state when documents are
+    added by the background indexer after the first tool call.
+
     Returns None if the chroma_db directory does not exist yet.
     """
-    global _retriever
-    if _retriever is None:
-        if not os.path.exists(CHROMA_PATH):
-            return None
-        embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-        vector_store = Chroma(
-            persist_directory=CHROMA_PATH,
-            embedding_function=embeddings
-        )
-        # k=6 gives the agent slightly more context than the old fixed k=4.
-        # The agent can decide how much of that context to use.
-        _retriever = vector_store.as_retriever(search_kwargs={"k": 6})
-    return _retriever
+    if not os.path.exists(CHROMA_PATH):
+        return None
+    embeddings = _get_embed_model()
+    vector_store = Chroma(
+        persist_directory=CHROMA_PATH,
+        embedding_function=embeddings,
+        collection_name=_COLLECTION_NAME,
+    )
+    # k=6 gives the agent slightly more context; no score threshold so all
+    # top-k results are returned regardless of similarity score.
+    return vector_store.as_retriever(search_kwargs={"k": 6})
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +106,23 @@ def oncology_rag_search(query: str) -> str:
     docs = retriever.invoke(query)
 
     if not docs:
-        return "No relevant oncology information found for this query."
+        # Check whether the collection itself is empty (helps diagnose fresh deployments).
+        try:
+            import chromadb as _cdb
+            _client = _cdb.PersistentClient(path=CHROMA_PATH)
+            _count = _client.get_or_create_collection(_COLLECTION_NAME).count()
+            if _count == 0:
+                return (
+                    "The local knowledge base is currently empty. "
+                    "The background indexer runs every 30 minutes; "
+                    "please wait a moment and try again, or run 'python updater.py' manually."
+                )
+        except Exception:
+            pass
+        return (
+            f"No relevant oncology information found in the knowledge base for: '{query}'. "
+            "Try rephrasing, or use fetch_pubmed_abstracts for a live literature search."
+        )
 
     # Format each retrieved chunk with its source so the LLM can cite it.
     results = []

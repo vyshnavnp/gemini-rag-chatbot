@@ -81,8 +81,15 @@ def _start_scheduler():
     Start the APScheduler background job to re-index the knowledge base
     every 30 minutes. Guards against being started more than once in the
     same Streamlit session.
+
+    Also triggers an immediate indexing run in a background thread so that
+    a fresh deployment doesn't serve empty RAG results for the first 30 min.
     """
     if not st.session_state.get("scheduler_started", False):
+        import threading
+        # Run initial indexing immediately (non-blocking) so docs are available
+        # from the very first user query, not 30 minutes after startup.
+        threading.Thread(target=update_knowledge_base, daemon=True).start()
         scheduler = BackgroundScheduler()
         scheduler.add_job(update_knowledge_base, "interval", minutes=30)
         scheduler.start()

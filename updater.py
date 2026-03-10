@@ -11,6 +11,9 @@ from langchain_core.documents import Document
 CHROMA_PATH = "chroma_db"
 DATA_PATH = "knowledge_base"
 METADATA_FILE = "index_metadata.json"
+# Must match _COLLECTION_NAME in tools/onco_tools.py so that the indexer and
+# retriever always read from and write to the same ChromaDB collection.
+COLLECTION_NAME = "langchain"
 # Multilingual Model (Task 6)
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
@@ -75,7 +78,8 @@ def update_knowledge_base():
     print(f"📚 Integrating {len(files_to_index)} new oncology resources.")
     
     embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-    db = Chroma(persist_directory=CHROMA_PATH, embedding_function=embeddings)
+    db = Chroma(persist_directory=CHROMA_PATH, embedding_function=embeddings,
+                collection_name=COLLECTION_NAME)
     
     for filepath in files_to_index:
         print(f"-> Processing {os.path.basename(filepath)}...")
