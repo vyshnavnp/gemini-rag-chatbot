@@ -139,7 +139,7 @@ def build_agent():
 
     # The LLM needs to support tool calling. Gemini 2.5 Flash supports it.
     llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
+        model="gemini-2.0-flash",
         api_key=api_key,
         temperature=0.3,   # Low temperature for factual medical responses.
     )
@@ -240,6 +240,16 @@ def run_agent(agent_graph, user_message: str, thread_id: str, image_b64: str = N
     """
     from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
     from agent.memory import make_run_config
+    from agent.cache import get_cached_response, store_response
+
+    # ---------------------------------------------------------------------------
+    # Cache check: skip the LLM entirely if we have a similar previous answer.
+    # Images always bypass the cache since the answer depends on visual content.
+    # ---------------------------------------------------------------------------
+    if not image_b64:
+        cached = get_cached_response(user_message)
+        if cached is not None:
+            return cached
 
     # If an image was uploaded, include the base64 string in the message
     # so the agent can pass it to analyze_medical_image if needed.
@@ -343,9 +353,16 @@ def run_agent(agent_graph, user_message: str, thread_id: str, image_b64: str = N
             seen.add(t)
             unique_tools.append(t)
 
-    return {
+    result = {
         "response": response_text,
         "graph_dot": graph_dot,
         "steps": steps,
         "tools_used": unique_tools,
+        "cache_hit": False,
     }
+
+    # Persist this response so future similar queries can be served from cache.
+    if not image_b64:
+        store_response(user_message, result)
+
+    return result

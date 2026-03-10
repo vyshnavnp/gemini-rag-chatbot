@@ -23,6 +23,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from updater import update_knowledge_base
 from agent.onco_agent import build_agent, run_agent
+from agent.cache import cache_size, clear_cache
 
 # ---------------------------------------------------------------------------
 # API Key Setup
@@ -161,6 +162,16 @@ st.sidebar.markdown("---")
 st.sidebar.markdown("**Session ID**")
 st.sidebar.code(st.session_state["thread_id"][:8] + "...", language=None)
 
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Response Cache**")
+st.sidebar.caption(
+    f"{cache_size()} response(s) cached. "
+    "Cached answers are served instantly without using API quota."
+)
+if st.sidebar.button("Clear response cache"):
+    deleted = clear_cache()
+    st.sidebar.success(f"Cleared {deleted} cached response(s).")
+
 st.sidebar.markdown("**Example prompts**")
 st.sidebar.markdown(
     "- What are the side effects of pembrolizumab?\n"
@@ -216,7 +227,7 @@ with col_chat:
                     if "429" in error_str or "quota" in error_str.lower():
                         user_msg = (
                             "The Gemini API free-tier daily quota has been reached "
-                            "(20 requests/day for gemini-2.5-flash).  "
+                            "(1500 requests/day for gemini-2.0-flash on the free tier).  "
                             "Please wait a few minutes and try again, or upgrade to "
                             "a paid API key at https://ai.dev/rate-limit."
                         )
@@ -232,8 +243,11 @@ with col_chat:
             response_text = result["response"]
             st.markdown(response_text)
 
-            # Show which tools were called as small inline badges.
-            if result["tools_used"]:
+            # Show cache hit notice or tools used as inline badges.
+            if result.get("cache_hit"):
+                similarity_pct = int(result.get("cache_similarity", 1.0) * 100)
+                st.caption(f"Served from cache (similarity: {similarity_pct}%) — no API quota used.")
+            elif result["tools_used"]:
                 tools_str = "  |  ".join(result["tools_used"])
                 st.caption(f"Tools used: {tools_str}")
 
