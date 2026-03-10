@@ -211,9 +211,19 @@ with col_chat:
                         image_b64=image_b64,
                     )
                 except Exception as e:
-                    # Surface any unhandled agent errors cleanly.
+                    error_str = str(e)
+                    # Give a user-friendly message for quota/rate-limit errors.
+                    if "429" in error_str or "quota" in error_str.lower():
+                        user_msg = (
+                            "The Gemini API free-tier daily quota has been reached "
+                            "(20 requests/day for gemini-2.5-flash).  "
+                            "Please wait a few minutes and try again, or upgrade to "
+                            "a paid API key at https://ai.dev/rate-limit."
+                        )
+                    else:
+                        user_msg = f"Agent encountered an error: {error_str}"
                     result = {
-                        "response": f"Agent encountered an error: {str(e)}",
+                        "response": user_msg,
                         "graph_dot": None,
                         "steps": [],
                         "tools_used": [],

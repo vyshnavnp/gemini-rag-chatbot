@@ -27,6 +27,8 @@
 # LangGraph handles the state (message list) automatically between each step.
 
 import os
+import re
+import time
 from typing import Annotated
 
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -256,11 +258,34 @@ def run_agent(agent_graph, user_message: str, thread_id: str, image_b64: str = N
 
     config = make_run_config(thread_id)
 
-    # Invoke the agent. LangGraph returns the full final state.
-    final_state = agent_graph.invoke(
-        {"messages": [input_message]},
-        config=config
-    )
+    # ---------------------------------------------------------------------------
+    # Invoke with automatic retry on 429 rate-limit responses.
+    # The free tier allows 20 requests/day. When the limit is hit, the API
+    # returns a 429 with a retry_delay field. We honour that delay (up to
+    # 60 s) and retry up to 3 times before propagating the error.
+    # ---------------------------------------------------------------------------
+    MAX_RETRIES = 3
+    for attempt in range(MAX_RETRIES):
+        try:
+            final_state = agent_graph.invoke(
+                {"messages": [input_message]},
+                config=config
+            )
+            break  # Success — exit the retry loop.
+        except Exception as exc:
+            error_str = str(exc)
+            # Check for a 429 quota error from the Gemini API.
+            if "429" in error_str and attempt < MAX_RETRIES - 1:
+                # Extract the suggested retry delay from the error message if
+                # present, otherwise fall back to 30 s exponential backoff.
+                match = re.search(r"retry.*?(\d+)\.?\d*\s*s", error_str, re.I)
+                wait = int(match.group(1)) + 2 if match else (30 * (2 ** attempt))
+                wait = min(wait, 60)  # Cap at 60 s to avoid hanging the UI.
+                time.sleep(wait)
+                continue
+            # For any other error (or final retry exhausted), re-raise so
+            # app.py can catch it and display a clean message.
+            raise
 
     # --- Parse the output ---
     # Walk through all messages produced in this turn to extract:
