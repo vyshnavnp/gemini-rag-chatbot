@@ -139,7 +139,7 @@ def build_agent():
 
     # The LLM needs to support tool calling. Gemini 2.5 Flash supports it.
     llm = ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash",
+        model="gemini-3.1-flash-lite-preview",
         api_key=api_key,
         temperature=0.3,   # Low temperature for factual medical responses.
     )

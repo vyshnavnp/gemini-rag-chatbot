@@ -83,7 +83,7 @@ APScheduler runs `updater.py` every 30 minutes in a background thread. It checks
 
 | Layer | Technology |
 |---|---|
-| LLM | Google Gemini 2.0 Flash (1500 req/day free tier) |
+| LLM | Google Gemini 3.1 Flash Lite Preview (500 req/day free tier) |
 | Agent Framework | LangGraph 0.2.x (ReAct + StateGraph) |
 | Orchestration | LangChain |
 | Embeddings | HuggingFace `paraphrase-multilingual-MiniLM-L12-v2` |
@@ -207,7 +207,7 @@ Everything else (UI, memory, cache, and tool output parsing) stays the same.
 
 ## API Quota Notes
 
-The project uses `gemini-2.0-flash`, which has a free-tier allowance of 1500 requests/day (vs 20/day for gemini-2.5-flash). The semantic cache further reduces live API calls by serving repeated or paraphrased questions from local storage. On quota exhaustion, the agent retries with the API-suggested delay before surfacing a user-friendly error.
+The project uses `gemini-3.1-flash-lite-preview`, which has a free-tier allowance of 500 requests/day. The semantic cache further reduces live API calls by serving repeated or paraphrased questions from local storage. On quota exhaustion, the agent retries with the API-suggested delay before surfacing a user-friendly error.
 
 ---
 

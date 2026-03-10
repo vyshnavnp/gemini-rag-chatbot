@@ -227,7 +227,7 @@ with col_chat:
                     if "429" in error_str or "quota" in error_str.lower():
                         user_msg = (
                             "The Gemini API free-tier daily quota has been reached "
-                            "(1500 requests/day for gemini-2.0-flash on the free tier).  "
+                            "(1500 requests/day for gemini-3.1-flash-lite-preview on the free tier).  "
                             "Please wait a few minutes and try again, or upgrade to "
                             "a paid API key at https://ai.dev/rate-limit."
                         )
