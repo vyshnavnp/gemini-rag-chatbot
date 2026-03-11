@@ -45,13 +45,21 @@ TOOLS — use the docstrings to decide which to call:
 - generate_pathway_diagram:         Call for visual diagrams or flowcharts. Wrap DOT
                                     output in triple backticks: ```dot ... ```
 - analyze_medical_image:            General image analysis with Gemini Vision.
+                                    The uploaded image is accessed automatically.
 - classify_breast_ultrasound:       Breast ultrasound image → benign/malignant/normal.
-                                    Use when user specifies a breast ultrasound scan.
+                                    Use when user uploads a breast ultrasound scan.
+                                    The uploaded image is accessed automatically.
 - classify_skin_lesion:             Skin lesion image → 7-class lesion classification.
-                                    Use when user specifies a skin/dermoscopy image.
+                                    Use when user uploads a skin/dermoscopy image.
+                                    The uploaded image is accessed automatically.
 - classify_cancer_type:             Gene expression CSV → cancer type classification
                                     (BRCA, KIRC, LUAD, PRAD, COAD).
-                                    Use when user provides genomic/gene expression data.
+                                    Use when user has uploaded gene expression data.
+                                    The uploaded CSV is accessed automatically.
+
+IMPORTANT: Image and CSV data are injected into tools automatically from the
+user's upload. Do NOT attempt to pass raw image or CSV data as tool arguments.
+Just call the appropriate tool — it will access the uploaded file.
 
 RULES:
 - If the question is unrelated to cancer or oncology, politely decline.
@@ -199,16 +207,31 @@ def _parse_final_state(final_state) -> dict:
                 "type": "observation",
                 "content": f"Tool '{msg.name}' returned:\n{tool_output}",
             })
+            # Capture DOT directly from generate_pathway_diagram tool output.
+            if msg.name == "generate_pathway_diagram" and msg.content.strip().startswith("digraph"):
+                graph_dot = msg.content.strip()
 
     if not response_text:
         response_text = "I'm sorry, I could not generate a response. Please try again."
 
-    # Extract DOT diagram code if embedded in the response.
-    if "```dot" in response_text:
+    # Extract DOT diagram code if embedded in the response (fallback).
+    if not graph_dot and "```dot" in response_text:
         parts = response_text.split("```dot")
         response_text = parts[0].strip()
         raw_dot = parts[1].split("```")[0].strip()
         graph_dot = raw_dot
+    elif not graph_dot and "```" in response_text and "digraph" in response_text:
+        parts = response_text.split("```")
+        for i, part in enumerate(parts):
+            if "digraph" in part and part.strip().startswith("digraph"):
+                graph_dot = part.strip()
+                parts[i] = ""
+                response_text = "```".join(parts).strip()
+                break
+    # Strip echoed DOT from response if already captured from tool output.
+    if graph_dot and "```dot" in response_text:
+        parts = response_text.split("```dot")
+        response_text = parts[0].strip()
 
     # Deduplicate tool names while preserving call order.
     seen: set = set()
@@ -228,13 +251,19 @@ def _parse_final_state(final_state) -> dict:
 
 
 def _build_input_message(user_message: str, image_b64: str = None, genomic_csv: str = None) -> HumanMessage:
-    """Build the HumanMessage, optionally embedding image or CSV data."""
+    """Build the HumanMessage.
+
+    - Image is sent as a proper multimodal content part so Gemini can see it.
+    - CSV is referenced (not inlined) since tools access it from shared state.
+    - Raw data is NOT dumped into the text; tools read it via session state.
+    """
     text = user_message
     if genomic_csv:
-        text += f"\n\n[GENOMIC_CSV_DATA]:\n{genomic_csv}"
+        text += "\n\n[A gene expression CSV file has been uploaded for analysis.]"
     if image_b64:
         return HumanMessage(content=[
-            {"type": "text", "text": f"{text}\n\n[IMAGE_DATA_BASE64]: {image_b64}"}
+            {"type": "text", "text": text},
+            {"type": "image_url", "image_url": f"data:image/jpeg;base64,{image_b64}"},
         ])
     return HumanMessage(content=text)
 
@@ -243,31 +272,38 @@ def run_agent(agent_graph, user_message: str, thread_id: str, image_b64: str = N
     """Run one synchronous agent turn. Returns result dict."""
     from agent.memory import make_run_config
     from agent.cache import get_cached_response, store_response
+    from tools.onco_tools import set_session_image, set_session_csv, clear_session_data
 
     if not image_b64 and not genomic_csv:
         cached = get_cached_response(user_message)
         if cached is not None:
             return cached
 
-    input_message = _build_input_message(user_message, image_b64, genomic_csv)
+    # Make uploaded data available to tools via shared session state.
+    set_session_image(image_b64)
+    set_session_csv(genomic_csv)
 
+    input_message = _build_input_message(user_message, image_b64, genomic_csv)
     config = make_run_config(thread_id)
 
-    for attempt in range(_MAX_RETRIES):
-        try:
-            final_state = agent_graph.invoke(
-                {"messages": [input_message]},
-                config=config,
-            )
-            break
-        except Exception as exc:
-            error_str = str(exc)
-            if "429" in error_str and attempt < _MAX_RETRIES - 1:
-                match = re.search(r"retry.*?(\d+)\.?\d*\s*s", error_str, re.I)
-                wait = int(match.group(1)) + 2 if match else (30 * (2 ** attempt))
-                time.sleep(min(wait, 60))
-                continue
-            raise
+    try:
+        for attempt in range(_MAX_RETRIES):
+            try:
+                final_state = agent_graph.invoke(
+                    {"messages": [input_message]},
+                    config=config,
+                )
+                break
+            except Exception as exc:
+                error_str = str(exc)
+                if "429" in error_str and attempt < _MAX_RETRIES - 1:
+                    match = re.search(r"retry.*?(\d+)\.?\d*\s*s", error_str, re.I)
+                    wait = int(match.group(1)) + 2 if match else (30 * (2 ** attempt))
+                    time.sleep(min(wait, 60))
+                    continue
+                raise
+    finally:
+        clear_session_data()
 
     result = _parse_final_state(final_state)
 
@@ -287,6 +323,7 @@ def stream_agent(
     """Stream one agent turn. Yields status/token/done event dicts."""
     from agent.memory import make_run_config
     from agent.cache import get_cached_response, store_response
+    from tools.onco_tools import set_session_image, set_session_csv, clear_session_data
 
     # Cache check.
     if not image_b64 and not genomic_csv:
@@ -295,8 +332,11 @@ def stream_agent(
             yield {"type": "done", **cached, "cache_hit": True}
             return
 
-    input_message = _build_input_message(user_message, image_b64, genomic_csv)
+    # Make uploaded data available to tools via shared session state.
+    set_session_image(image_b64)
+    set_session_csv(genomic_csv)
 
+    input_message = _build_input_message(user_message, image_b64, genomic_csv)
     config = make_run_config(thread_id)
 
     full_response = ""
@@ -331,6 +371,8 @@ def stream_agent(
                                 yield {"type": "status", "content": f"Using {name}..."}
 
                     # Tool results → transparency panel.
+                    # Also capture DOT output from generate_pathway_diagram directly,
+                    # so we don't depend on the LLM echoing it back.
                     if isinstance(msg, ToolMessage):
                         raw = msg.content if isinstance(msg.content, str) else _safe_content(msg.content)
                         tool_output = raw[:300] + "..." if len(raw) > 300 else raw
@@ -338,6 +380,8 @@ def stream_agent(
                             "type": "observation",
                             "content": f"Tool '{msg.name}' returned:\n{tool_output}",
                         })
+                        if msg.name == "generate_pathway_diagram" and raw.strip().startswith("digraph"):
+                            graph_dot = raw.strip()
 
                     # Final AI response (no tool calls = final answer).
                     if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
@@ -379,12 +423,33 @@ def stream_agent(
         full_response = "I'm sorry, I could not generate a response. Please try again."
         yield {"type": "token", "content": full_response}
 
-    # Extract DOT code.
-    if "```dot" in full_response:
+    # Extract DOT code from response text (if LLM echoed it) as a fallback.
+    # The primary capture happens above when we intercept the tool output.
+    if not graph_dot and "```dot" in full_response:
         parts = full_response.split("```dot")
         full_response = parts[0].strip()
         raw_dot = parts[1].split("```")[0].strip()
         graph_dot = raw_dot
+    elif not graph_dot and "```" in full_response and "digraph" in full_response:
+        # LLM used generic ``` fences without the "dot" language hint
+        parts = full_response.split("```")
+        for i, part in enumerate(parts):
+            if "digraph" in part:
+                candidate = part.strip()
+                if candidate.startswith("digraph"):
+                    graph_dot = candidate
+                    # Remove the DOT block from the displayed response
+                    parts[i] = ""
+                    full_response = "```".join(parts).strip()
+                    break
+    # If DOT was captured from tool output, still strip any echoed DOT from the response text.
+    if graph_dot and "```dot" in full_response:
+        parts = full_response.split("```dot")
+        full_response = parts[0].strip()
+    elif graph_dot and "digraph" in full_response and "```" in full_response:
+        parts = full_response.split("```")
+        cleaned = [p for i, p in enumerate(parts) if "digraph" not in p or i % 2 == 0]
+        full_response = "".join(cleaned).strip()
 
     # Deduplicate tools.
     seen: set = set()
@@ -405,4 +470,5 @@ def stream_agent(
     if not image_b64 and not genomic_csv:
         store_response(user_message, result)
 
+    clear_session_data()
     yield {"type": "done", **result}

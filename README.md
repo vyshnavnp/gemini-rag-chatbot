@@ -30,13 +30,31 @@ User query → Cache check (ChromaDB cosine ≥ 0.92) → Cache hit? → Return 
          │  ML Classification:                                        │
          │  ├── classify_breast_ultrasound (OncoScanBC, MobileNetV2)  │
          │  ├── classify_skin_lesion      (OncoScanSkin, MobileNetV2) │
-         │  └── classify_cancer_type          (OncoTypeBC, PyTorch)  │
+         │  └── classify_cancer_type      (OncoTypeBC, MLP)           │
          └───────────────────────────────────────────────────────────┘
                                     │
                         Store response in cache
 ```
 
 2–3 API calls per query. At 500 RPD free tier → ~170–250 queries/day.
+
+### Data flow for ML tools
+
+Uploaded files (images, CSVs) are stored in **session-level shared state** inside
+`tools/onco_tools.py`. Tools read directly from this state — the LLM never needs
+to pass raw binary data through tool arguments. The flow:
+
+```
+User upload → app.py reads bytes
+            → onco_agent.py calls set_session_image() / set_session_csv()
+            → LLM decides which tool to call (no data args needed)
+            → Tool reads from _session_image_b64 / _session_genomic_csv
+            → clear_session_data() after agent finishes
+```
+
+For images, the base64 is also sent as a proper multimodal content part
+in the HumanMessage, so Gemini can visually see it and decide which
+classifier to use.
 
 ---
 
@@ -50,9 +68,23 @@ User query → Cache check (ChromaDB cosine ≥ 0.92) → Cache hit? → Return 
 - **Reasoning Transparency**: The UI shows every tool call, arguments, and observations.
 - **Multilingual**: `paraphrase-multilingual-MiniLM-L12-v2` embeddings match any language against the English knowledge base.
 - **Multimodal**: Image upload → Gemini Vision analysis or CNN classification.
-- **Biological Pathway Diagrams**: Graphviz DOT generation rendered live in the UI.
-- **ML Classification**: OncoScanBC (breast ultrasound), OncoScanSkin (dermoscopy), OncoTypeBC (molecular subtyping).
+- **Biological Pathway Diagrams**: Graphviz DOT output captured directly from tool results and rendered inline.
+- **ML Classification**: OncoScanBC (breast ultrasound, 3 classes), OncoScanSkin (dermoscopy, 7 classes), OncoTypeBC (gene expression → 5 TCGA cancer types).
 - **Auto-updating Knowledge Base**: APScheduler re-indexes `knowledge_base/` every 30 minutes.
+- **RAGAS Evaluation**: Measures faithfulness and answer relevancy using Gemini as an LLM judge.
+
+---
+
+## ML Models
+
+| Model | Task | Architecture | Classes |
+|---|---|---|---|
+| OncoScanBC | Breast ultrasound classification | MobileNetV2 | benign, malignant, normal |
+| OncoScanSkin | Skin lesion classification | MobileNetV2 | 7 HAM10000 classes |
+| OncoTypeBC | Cancer type from gene expression | Custom MLP (20531→512→128→5) | BRCA, KIRC, LUAD, PRAD, COAD |
+
+Model weights are stored in `models/` and loaded lazily on first use.
+OncoTypeBC also requires `scaler.pkl` (StandardScaler) and `label_ecoder.pkl` (LabelEncoder).
 
 ---
 
@@ -61,14 +93,14 @@ User query → Cache check (ChromaDB cosine ≥ 0.92) → Cache hit? → Return 
 | Layer | Technology |
 |---|---|
 | LLM | Google Gemini 3.1 Flash Lite Preview (500 req/day free tier) |
-| Agent Framework | LangGraph 1.0.x (single-agent, StateGraph) |
+| Agent Framework | LangGraph 1.0.10 (single-agent, StateGraph) |
 | Orchestration | LangChain |
 | Embeddings | HuggingFace `paraphrase-multilingual-MiniLM-L12-v2` |
-| Vector DB | ChromaDB (RAG + response cache) |
-| ML Models | PyTorch MobileNetV2 (OncoScanBC, OncoScanSkin, OncoTypeBC) |
-| External APIs | ClinicalTrials.gov, NCBI PubMed, arXiv |
+| Vector DB | ChromaDB (RAG collection + response cache collection) |
+| ML Models | PyTorch 2.3.0 (CPU), MobileNetV2, custom MLP |
+| External APIs | ClinicalTrials.gov v2, NCBI PubMed E-utilities, arXiv |
 | App Framework | Streamlit |
-| Containerization | Docker, Docker Compose |
+| Containerization | Docker (python:3.11-slim), Docker Compose |
 | Cloud | AWS EC2 (t3.medium), AWS ECR |
 | CI/CD | GitHub Actions |
 
@@ -81,18 +113,18 @@ gemini_rag_chatbot/
 ├── .github/workflows/deploy.yml
 ├── agent/
 │   ├── __init__.py
-│   ├── cache.py           # Semantic query-response cache
+│   ├── cache.py           # Semantic query-response cache (cosine ≥ 0.92)
 │   ├── memory.py          # MemorySaver checkpointer
-│   └── onco_agent.py      # Single-agent LangGraph graph
+│   └── onco_agent.py      # Single-agent LangGraph graph + streaming
 ├── tools/
 │   ├── __init__.py
-│   ├── onco_tools.py      # RAG, image analysis, diagrams, ML classifiers
+│   ├── onco_tools.py      # RAG, vision, diagrams, ML classifiers, session state
 │   └── external_tools.py  # ClinicalTrials.gov, PubMed, arXiv
 ├── evaluation/
 │   └── ragas_eval.py      # RAGAS faithfulness/relevancy evaluation
-├── knowledge_base/        # MedQuAD XMLs and arXiv PDFs
-├── models/                # PyTorch model weights (not committed)
-├── app.py                 # Streamlit UI
+├── knowledge_base/        # MedQuAD XML question-answer pairs
+├── models/                # PyTorch model weights (.pth, .pkl)
+├── app.py                 # Streamlit UI (centered layout, chat-focused)
 ├── updater.py             # Incremental knowledge base indexer
 ├── test_agent.py          # End-to-end verification script
 ├── requirements.txt
@@ -118,6 +150,8 @@ python updater.py        # Build knowledge base (first time)
 python test_agent.py     # Verify everything works
 streamlit run app.py
 ```
+
+Model weights are included in the repo (~60 MB). No extra download step needed.
 
 ---
 

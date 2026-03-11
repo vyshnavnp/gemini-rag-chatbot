@@ -74,6 +74,7 @@ if "last_tools_used" not in st.session_state:
 # ---------------------------------------------------------------------------
 
 st.sidebar.markdown("### Upload Files")
+st.sidebar.caption("Medical Image (scan, dermoscopy)")
 uploaded_file = st.sidebar.file_uploader(
     "Medical image (scan, dermoscopy, diagram)",
     type=["jpg", "jpeg", "png"],
@@ -84,6 +85,7 @@ if uploaded_file:
     st.sidebar.image(uploaded_file, use_container_width=True)
     uploaded_file.seek(0)
 
+st.sidebar.caption("Gene Expression CSV (OncoTypeBC)")
 uploaded_csv = st.sidebar.file_uploader(
     "Gene expression CSV",
     type=["csv"],

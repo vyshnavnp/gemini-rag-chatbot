@@ -14,6 +14,30 @@ CHROMA_PATH = os.path.join(_PROJECT_ROOT, "chroma_db")
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 GENERATOR_MODEL = "gemini-3.1-flash-lite-preview"
 
+# ---------------------------------------------------------------------------
+# Session-level shared state for uploaded data (image / CSV).
+# Tools read from these instead of receiving raw data through LLM tool args,
+# because LLMs cannot reliably pass 100K+ char strings as arguments.
+# ---------------------------------------------------------------------------
+_session_image_b64: str | None = None
+_session_genomic_csv: str | None = None
+
+
+def set_session_image(b64: str | None) -> None:
+    global _session_image_b64
+    _session_image_b64 = b64
+
+
+def set_session_csv(csv_str: str | None) -> None:
+    global _session_genomic_csv
+    _session_genomic_csv = csv_str
+
+
+def clear_session_data() -> None:
+    global _session_image_b64, _session_genomic_csv
+    _session_image_b64 = None
+    _session_genomic_csv = None
+
 _embed_model = None
 _COLLECTION_NAME = "langchain"
 
@@ -100,24 +124,24 @@ def oncology_rag_search(query: str) -> str:
 
 
 @tool
-def analyze_medical_image(question: str, image_b64: str) -> str:
+def analyze_medical_image(question: str) -> str:
     """
     Analyze a medical image (scan, diagram, or pathology slide) using
     Google Gemini's vision capability.
 
     Use this tool when the user has uploaded an image and is asking a
-    question about it. The image must already be base64-encoded before
-    passing it to this tool.
+    general question about it. The uploaded image is accessed automatically.
 
     Args:
         question: The user's question about the image.
-        image_b64: The base64-encoded image bytes as a string (no data URI
-                   prefix -- just the raw base64 string).
 
     Returns:
         A string with Gemini's interpretation of the medical image in the
         context of the user's question.
     """
+    if not _session_image_b64:
+        return "No image uploaded. Please upload a medical image first."
+
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return "GEMINI_API_KEY is not set. Cannot perform image analysis."
@@ -135,7 +159,7 @@ def analyze_medical_image(question: str, image_b64: str) -> str:
         },
         {
             "type": "image_url",
-            "image_url": f"data:image/jpeg;base64,{image_b64}"
+            "image_url": f"data:image/jpeg;base64,{_session_image_b64}"
         }
     ])
 
@@ -258,34 +282,38 @@ def _preprocess_image_b64(image_b64: str):
 
 
 @tool
-def classify_breast_ultrasound(image_b64: str) -> str:
+def classify_breast_ultrasound(clinical_context: str = "Breast ultrasound classification") -> str:
     """
     Classify a breast ultrasound image as benign, malignant, or normal
     using the OncoScanBC MobileNetV2 deep learning model.
 
     Use this tool ONLY when the user has uploaded a breast ultrasound
     image and wants a classification or diagnosis prediction.
+    The uploaded image is accessed automatically — do NOT pass image data.
 
     This is a trained CNN classifier — it returns a predicted class and
     confidence score, NOT a free-text description. For general image
     analysis or non-ultrasound images, use analyze_medical_image instead.
 
     Args:
-        image_b64: The base64-encoded image bytes as a string.
+        clinical_context: Optional clinical context or notes about the scan.
 
     Returns:
         A string reporting the predicted class and confidence percentage.
     """
+    if not _session_image_b64:
+        return "No image uploaded. Please upload a breast ultrasound image first."
+
     model = _load_oncoscanbc_model()
     if model is None:
         return (
             "OncoScanBC model is not available. "
-            "Place the trained weights at: models/oncoscanbc_mobilenetv2.pth"
+            "Place the trained weights at: models/oncoscan_bc.pth"
         )
 
     import torch
 
-    tensor = _preprocess_image_b64(image_b64)
+    tensor = _preprocess_image_b64(_session_image_b64)
     with torch.no_grad():
         outputs = model(tensor)
         probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
@@ -340,34 +368,38 @@ def _load_oncoscanskin_model():
 
 
 @tool
-def classify_skin_lesion(image_b64: str) -> str:
+def classify_skin_lesion(clinical_context: str = "Skin lesion classification") -> str:
     """
     Classify a cutaneous (skin) lesion from a dermoscopy or microscopy
     image using the OncoScanSkin MobileNetV2 deep learning model.
 
     Use this tool ONLY when the user has uploaded a skin lesion image
     and wants a classification or melanoma screening prediction.
+    The uploaded image is accessed automatically — do NOT pass image data.
 
     Supported classes: actinic keratoses, basal cell carcinoma,
     benign keratosis-like lesions, dermatofibroma, melanoma,
     melanocytic nevi, vascular lesions.
 
     Args:
-        image_b64: The base64-encoded image bytes as a string.
+        clinical_context: Optional clinical context or notes about the lesion.
 
     Returns:
         A string reporting the predicted class and confidence percentage.
     """
+    if not _session_image_b64:
+        return "No image uploaded. Please upload a skin lesion image first."
+
     model = _load_oncoscanskin_model()
     if model is None:
         return (
             "OncoScanSkin model is not available. "
-            "Place the trained weights at: models/oncoscanskin_mobilenetv2.pth"
+            "Place the trained weights at: models/oncoscan_skin.pth"
         )
 
     import torch
 
-    tensor = _preprocess_image_b64(image_b64)
+    tensor = _preprocess_image_b64(_session_image_b64)
     with torch.no_grad():
         outputs = model(tensor)
         probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
@@ -461,13 +493,14 @@ def _load_oncotypebc_model():
 
 
 @tool
-def classify_cancer_type(genomic_csv: str) -> str:
+def classify_cancer_type(analysis_note: str = "Cancer type classification") -> str:
     """
     Classify cancer type from gene expression data using the OncoTypeBC
     deep learning model trained on TCGA RNA-Seq data.
 
-    Use this tool ONLY when the user provides genomic or gene expression
-    data as a CSV string and wants a cancer type prediction.
+    Use this tool ONLY when the user has uploaded a gene expression CSV
+    file and wants a cancer type prediction.
+    The uploaded CSV is accessed automatically — do NOT pass CSV data.
 
     The five predicted cancer types are:
     - BRCA (Breast Invasive Carcinoma)
@@ -477,12 +510,14 @@ def classify_cancer_type(genomic_csv: str) -> str:
     - COAD (Colon Adenocarcinoma)
 
     Args:
-        genomic_csv: A CSV string with gene expression features.
-                     First row must be headers. One sample per row.
+        analysis_note: Optional note about the sample or analysis request.
 
     Returns:
         A string reporting the predicted cancer type and confidence.
     """
+    if not _session_genomic_csv:
+        return "No gene expression CSV uploaded. Please upload a CSV file first."
+
     model, scaler, label_encoder = _load_oncotypebc_model()
     if model is None:
         return (
@@ -494,7 +529,7 @@ def classify_cancer_type(genomic_csv: str) -> str:
     import csv
     import torch
 
-    reader = csv.reader(io.StringIO(genomic_csv))
+    reader = csv.reader(io.StringIO(_session_genomic_csv))
     rows = list(reader)
     if len(rows) < 2:
         return "Invalid CSV: need at least a header row and one data row."

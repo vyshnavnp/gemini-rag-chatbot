@@ -9,6 +9,9 @@ from tools.onco_tools import (
     classify_breast_ultrasound,
     classify_skin_lesion,
     classify_cancer_type,
+    set_session_image,
+    set_session_csv,
+    clear_session_data,
 )
 
 from tools.external_tools import (
