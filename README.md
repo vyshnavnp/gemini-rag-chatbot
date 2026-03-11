@@ -1,99 +1,58 @@
 # OncoBot: Agentic Cancer Research Assistant
 
-OncoBot is a production-grade, containerized agentic AI system designed to assist cancer researchers, clinicians, and patients with oncology inquiries.
+OncoBot is an agentic AI system for oncology — it assists cancer researchers, clinicians, and patients with oncology inquiries using a **single-agent LangGraph architecture** with 9 tools, semantic caching, and conversational memory.
 
-It was originally built as a standard RAG chatbot and has been upgraded to a full **LangGraph ReAct agent** with multi-tool reasoning, conversational memory, live external data sources, a semantic response cache, and a multi-agent supervisor architecture.
-
-Deployed on AWS EC2 via a fully automated GitHub Actions CI/CD pipeline.
+Deployed on AWS EC2 via GitHub Actions CI/CD.
 
 ---
 
 ## Architecture
 
-### v1 (original): Static RAG chain
 ```
-User query → ChromaDB retriever (k=4) → Prompt template → Gemini LLM → Response
-```
-
-### v2 (current): Two-model LangGraph pipeline with semantic cache
-```
-User query → Cache check (ChromaDB cosine similarity >= 0.92) → Cache hit? → Return instantly
-                                    |
+User query → Cache check (ChromaDB cosine ≥ 0.92) → Cache hit? → Return instantly
+                                    │
                                Cache miss
-                                    |
-         ┌─────────────── PLANNER (gemini-2.5-flash) ───────────────┐
-         │  Decides which tools to call. Loops until research done.  │
+                                    │
+         ┌────────── AGENT (gemini-3.1-flash-lite-preview) ──────────┐
+         │  Single LangGraph node, picks tools from docstrings.       │
+         │  ReAct loop: up to 5 tool iterations per turn.             │
          │                                                            │
-         │  ├── get_sentiment_tone        (DistilBERT, local)        │
-         │  ├── oncology_rag_search       (ChromaDB vector store)    │
-         │  ├── fetch_pubmed_abstracts    (NCBI E-utilities API)     │
-         │  ├── search_clinical_trials    (ClinicalTrials.gov API v2)│
-         │  ├── generate_pathway_diagram  (Gemini → Graphviz DOT)   │
-         │  ├── analyze_medical_image     (Gemini Vision)            │
-         │  └── summarize_arxiv_paper     (arXiv API)               │
-         └──────────────────────────────────────────────────────────┘
-                                    |
-                    Planner done (no more tool calls)
-                                    |
-         ┌────────── SUMMARIZER (gemini-3.1-flash-lite-preview) ─────┐
-         │  Reads full conversation + all tool results.               │
-         │  Writes the final clean user-facing answer.                │
-         │  Never calls tools → no thought_signature error.           │
+         │  RAG & Search:                                             │
+         │  ├── oncology_rag_search       (ChromaDB vector store)     │
+         │  ├── fetch_pubmed_abstracts    (NCBI E-utilities API)      │
+         │  ├── search_clinical_trials    (ClinicalTrials.gov v2)     │
+         │  └── summarize_arxiv_paper     (arXiv API)                 │
+         │                                                            │
+         │  Vision & Diagrams:                                        │
+         │  ├── analyze_medical_image     (Gemini Vision)             │
+         │  └── generate_pathway_diagram  (Gemini → Graphviz DOT)    │
+         │                                                            │
+         │  ML Classification:                                        │
+         │  ├── classify_breast_ultrasound (OncoScanBC, MobileNetV2)  │
+         │  ├── classify_skin_lesion      (OncoScanSkin, MobileNetV2) │
+         │  └── classify_cancer_type          (OncoTypeBC, PyTorch)  │
          └───────────────────────────────────────────────────────────┘
-                                    |
+                                    │
                         Store response in cache
 ```
 
-Why two models? `gemini-3.1-flash-lite` has thinking mode enabled by default. When a
-thinking model calls tools, it generates internal thought tokens that require a
-`thought_signature` echoed back with each tool result. LangGraph's `ToolNode` does not
-handle this, causing a gRPC error. The fix: `gemini-2.5-flash` handles all tool calling
-(stable, no thought_signature issue), and `gemini-3.1-flash-lite` only synthesizes text
-(no tools bound → no error). This also leverages the higher free-tier quota of Flash Lite
-(500 RPD vs 20 RPD) for the synthesis-only step.
-
-The agent runs a Thought → Action → Observation loop (ReAct pattern) until it has a complete answer. It uses `MemorySaver` checkpointing to maintain conversation history per session, so follow-up questions work without repeating context.
-
-A **multi-agent supervisor** (`agent/supervisor.py`) is also implemented as an optional alternative. It routes queries to specialist sub-agents: a Research Agent (RAG + PubMed + arXiv), a Clinical Agent (trials + treatment info), and a Support Agent (empathetic patient responses). It is not active by default — swap it in by changing one line in `app.py`.
+2–3 API calls per query. At 500 RPD free tier → ~170–250 queries/day.
 
 ---
 
 ## Key Features
 
-**Agentic Reasoning**
-The LLM decides which tools to call and in what order based on the query. A factual question about cisplatin will trigger RAG search. "Latest research on CAR-T" will also trigger PubMed. "Are there trials for stage 4 lung cancer?" will trigger ClinicalTrials.gov. The agent chains these calls as needed.
-
-**Semantic Response Cache**
-Responses to previous queries are stored in a dedicated ChromaDB collection using the same embedding model as the RAG retriever. On every new query, the cache is checked first. If a semantically similar query exists (cosine similarity >= 0.92), the stored answer is returned immediately — no API call, no quota consumed. Paraphrases like "side effects of cisplatin" and "cisplatin adverse effects" resolve to the same cache entry. Image analysis responses are excluded from the cache since they depend on visual content. The cache is visible and clearable from the sidebar.
-
-**Rate-limit Handling**
-The agent retries automatically on Gemini API 429 (quota exceeded) errors, honouring the `retry_delay` field returned by the API, with a 60-second cap per wait. If the quota is exhausted after all retries, the user receives a plain-English message explaining the limit rather than a raw stack trace.
-
-**Conversational Memory**
-Each browser session gets a unique thread ID. LangGraph's `MemorySaver` stores the full message history for that thread, so the agent can answer follow-up questions with context from earlier in the conversation.
-
-**Live External Data**
-- ClinicalTrials.gov REST API v2: searches recruiting trials by condition and phase. No API key required.
-- NCBI PubMed E-utilities: fetches recent peer-reviewed abstracts. No API key required.
-- arXiv API: looks up specific papers by ID on demand.
-
-**Reasoning Transparency**
-The right panel of the UI shows a collapsible "Agent Reasoning" section that lists every tool call, its arguments, and the observation returned — so users can see exactly how the agent arrived at its answer. Cache hits are labelled with their similarity score.
-
-**Sentiment-Aware Responses**
-DistilBERT classifies emotional queries as distressed. The agent calls `get_sentiment_tone` only when the query sounds personal or emotional (fear, worry, diagnosis news) — factual and research queries skip sentiment analysis entirely to avoid unnecessary tool calls.
-
-**Multilingual**
-The `paraphrase-multilingual-MiniLM-L12-v2` embedding model allows queries in any language to match against the English knowledge base. The LLM responds in the language the user wrote in.
-
-**Multimodal**
-Users can upload a medical scan or diagram. The image is base64-encoded and passed to Gemini Vision via the `analyze_medical_image` tool.
-
-**Biological Pathway Diagrams**
-The `generate_pathway_diagram` tool prompts Gemini to produce Graphviz DOT code, which is rendered live in the UI with `st.graphviz_chart`.
-
-**Auto-updating Knowledge Base**
-APScheduler runs `updater.py` every 30 minutes in a background thread. It checks file modification times and only re-indexes changed files, so adding a new PDF or XML to `knowledge_base/` is picked up automatically without restarting the container.
+- **Agentic Reasoning**: The LLM decides which tools to call based on the query. Factual questions trigger RAG; "latest research" triggers PubMed; trial queries trigger ClinicalTrials.gov.
+- **Semantic Cache**: ChromaDB-backed response cache (cosine ≥ 0.92). Paraphrases resolve to the same entry. No API quota consumed on cache hits.
+- **Rate-limit Handling**: Auto-retries on 429 errors with API-suggested delays, 60s cap.
+- **Conversational Memory**: MemorySaver checkpointing per session thread. Follow-up questions work without repeating context.
+- **Live External Data**: ClinicalTrials.gov, PubMed, arXiv — all free, no API keys needed.
+- **Reasoning Transparency**: The UI shows every tool call, arguments, and observations.
+- **Multilingual**: `paraphrase-multilingual-MiniLM-L12-v2` embeddings match any language against the English knowledge base.
+- **Multimodal**: Image upload → Gemini Vision analysis or CNN classification.
+- **Biological Pathway Diagrams**: Graphviz DOT generation rendered live in the UI.
+- **ML Classification**: OncoScanBC (breast ultrasound), OncoScanSkin (dermoscopy), OncoTypeBC (molecular subtyping).
+- **Auto-updating Knowledge Base**: APScheduler re-indexes `knowledge_base/` every 30 minutes.
 
 ---
 
@@ -101,13 +60,12 @@ APScheduler runs `updater.py` every 30 minutes in a background thread. It checks
 
 | Layer | Technology |
 |---|---|
-| LLM (Planner) | Google Gemini 2.5 Flash — tool calling (20 req/day free tier) |
-| LLM (Summarizer) | Google Gemini 3.1 Flash Lite Preview — synthesis only (500 req/day) |
-| Agent Framework | LangGraph 1.0.x (two-model pipeline, StateGraph) |
+| LLM | Google Gemini 3.1 Flash Lite Preview (500 req/day free tier) |
+| Agent Framework | LangGraph 1.0.x (single-agent, StateGraph) |
 | Orchestration | LangChain |
 | Embeddings | HuggingFace `paraphrase-multilingual-MiniLM-L12-v2` |
-| Vector DB | ChromaDB (RAG + response cache, persistent Docker volume) |
-| Sentiment | Transformers DistilBERT |
+| Vector DB | ChromaDB (RAG + response cache) |
+| ML Models | PyTorch MobileNetV2 (OncoScanBC, OncoScanSkin, OncoTypeBC) |
 | External APIs | ClinicalTrials.gov, NCBI PubMed, arXiv |
 | App Framework | Streamlit |
 | Containerization | Docker, Docker Compose |
@@ -120,25 +78,23 @@ APScheduler runs `updater.py` every 30 minutes in a background thread. It checks
 
 ```
 gemini_rag_chatbot/
-├── .github/
-│   └── workflows/
-│       └── deploy.yml          # GitHub Actions: build -> push ECR -> SSH deploy EC2
+├── .github/workflows/deploy.yml
 ├── agent/
 │   ├── __init__.py
-│   ├── cache.py                # Semantic query-response cache (ChromaDB, cosine similarity)
-│   ├── memory.py               # MemorySaver checkpointer, thread-scoped session memory
-│   ├── onco_agent.py           # LangGraph ReAct agent (default)
-│   └── supervisor.py           # Multi-agent supervisor with specialist routing (optional)
+│   ├── cache.py           # Semantic query-response cache
+│   ├── memory.py          # MemorySaver checkpointer
+│   └── onco_agent.py      # Single-agent LangGraph graph
 ├── tools/
 │   ├── __init__.py
-│   ├── onco_tools.py           # RAG search, image analysis, diagram gen, sentiment
-│   └── external_tools.py       # ClinicalTrials.gov, PubMed, arXiv tools
-├── knowledge_base/             # MedQuAD XMLs and arXiv PDFs (mounted as Docker volume)
-├── app.py                      # Streamlit UI: chat, visualization panel, reasoning panel
-├── updater.py                  # Incremental knowledge base indexer
-├── fetch_cancer_data.py        # arXiv scraper to populate knowledge_base/
-├── test_agent.py               # 12-step verification script (run before deploying)
-├── check_models.py             # Lists available Gemini models for your API key
+│   ├── onco_tools.py      # RAG, image analysis, diagrams, ML classifiers
+│   └── external_tools.py  # ClinicalTrials.gov, PubMed, arXiv
+├── evaluation/
+│   └── ragas_eval.py      # RAGAS faithfulness/relevancy evaluation
+├── knowledge_base/        # MedQuAD XMLs and arXiv PDFs
+├── models/                # PyTorch model weights (not committed)
+├── app.py                 # Streamlit UI
+├── updater.py             # Incremental knowledge base indexer
+├── test_agent.py          # End-to-end verification script
 ├── requirements.txt
 ├── Dockerfile
 └── docker-compose.yml
@@ -148,30 +104,18 @@ gemini_rag_chatbot/
 
 ## Local Development
 
-**Prerequisites:** Python 3.11, a Gemini API key.
-
 ```bash
-# 1. Clone and create venv
 git clone https://github.com/vyshnavnp/gemini-rag-chatbot.git
 cd gemini-rag-chatbot
-python -m venv .venv
-.venv\Scripts\activate          # Windows
-# source .venv/bin/activate     # Linux/Mac
+python -m venv .venv && .venv\Scripts\activate
 
-# 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Add your API key
 mkdir .streamlit
 echo 'GEMINI_API_KEY = "your-key-here"' > .streamlit/secrets.toml
 
-# 4. Build the knowledge base (first time only)
-python updater.py
-
-# 5. Run the verification suite
-python test_agent.py
-
-# 6. Start the app
+python updater.py        # Build knowledge base (first time)
+python test_agent.py     # Verify everything works
 streamlit run app.py
 ```
 
@@ -179,56 +123,21 @@ streamlit run app.py
 
 ## EC2 Deployment
 
-The GitHub Actions workflow in `.github/workflows/deploy.yml` handles deployment automatically on every push to `main`.
-
-It:
-1. Builds the Docker image
-2. Pushes it to AWS ECR
-3. SSHs into EC2, pulls the new image, and restarts the container via `docker compose up -d`
+GitHub Actions (`.github/workflows/deploy.yml`) builds, pushes to ECR, and deploys on every push to `main`.
 
 Required GitHub Actions secrets:
 ```
-AWS_ACCESS_KEY_ID
-AWS_SECRET_ACCESS_KEY
-AWS_REGION
-ECR_REGISTRY
-ECR_REPOSITORY
-EC2_HOST
-EC2_SSH_KEY
-GEMINI_API_KEY
+AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION,
+ECR_REGISTRY, ECR_REPOSITORY, EC2_HOST, EC2_SSH_KEY, GEMINI_API_KEY
 ```
 
-On first deployment, after the container starts, build the knowledge base inside the container:
-```bash
-docker exec -it oncobot-container python updater.py
-```
-
-After that, the background scheduler handles updates automatically every 30 minutes.
+First deployment: `docker exec -it oncobot-container python updater.py`
 
 ---
 
-## Switching to Multi-Agent Mode
+## API Quota
 
-To use the supervisor with specialist agents instead of the single ReAct agent, change one line in `app.py`:
-
-```python
-# In the load_agent() function, replace:
-return build_agent()
-
-# With:
-from agent.supervisor import build_supervisor
-return build_supervisor()
-```
-
-Everything else (UI, memory, cache, and tool output parsing) stays the same.
-
----
-
-## API Quota Notes
-
-The project uses `gemini-2.5-flash`. The free-tier limit is 20 requests/day, but the semantic cache serves repeated and paraphrased questions from local ChromaDB storage without consuming any quota, so in normal demo usage the limit is rarely reached. On quota exhaustion, the agent retries with the API-suggested delay before surfacing a user-friendly error.
-
-Note: newer preview models (e.g. `gemini-3.1-flash-lite-preview`) have higher free-tier quotas but trigger a `thought_signature` error when used with LangGraph ToolNode because their thinking mode requires echoing back thought tokens that the current LangChain gRPC transport does not support. `gemini-2.5-flash` does not exhibit this issue.
+The project uses `gemini-3.1-flash-lite-preview` (500 RPD free tier). The semantic cache serves repeated and paraphrased queries without consuming quota. On exhaustion, the agent retries with the API-suggested delay before showing a user-friendly error.
 
 ---
 

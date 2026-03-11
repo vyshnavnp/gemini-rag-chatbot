@@ -6,6 +6,9 @@ from tools.onco_tools import (
     oncology_rag_search,
     analyze_medical_image,
     generate_pathway_diagram,
+    classify_breast_ultrasound,
+    classify_skin_lesion,
+    classify_cancer_type,
 )
 
 from tools.external_tools import (
@@ -18,6 +21,9 @@ __all__ = [
     "oncology_rag_search",
     "analyze_medical_image",
     "generate_pathway_diagram",
+    "classify_breast_ultrasound",
+    "classify_skin_lesion",
+    "classify_cancer_type",
     "search_clinical_trials",
     "fetch_pubmed_abstracts",
     "summarize_arxiv_paper",

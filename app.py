@@ -1,19 +1,4 @@
-# app.py
-#
-# OncoBot - Agentic Oncology Research Assistant
-#
-# This is the main Streamlit application. It wires together:
-#   - The LangGraph ReAct agent (agent/onco_agent.py)
-#   - The background knowledge base updater (updater.py)
-#   - The Streamlit UI: chat, sidebar, visualization panel, reasoning panel
-#
-# What changed from v1:
-#   Before: user query -> retriever -> prompt -> LLM -> response (one shot, no reasoning)
-#   After:  user query -> agent reasons -> calls tools as needed -> synthesizes response
-#
-# The agent handles sentiment analysis, RAG search, PubMed, ClinicalTrials,
-# and image analysis as individual tool calls. The UI now shows which tools
-# were used and the agent's reasoning steps in a collapsible panel.
+# app.py — OncoBot Streamlit application.
 
 import streamlit as st
 import os
@@ -22,14 +7,12 @@ import base64
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from updater import update_knowledge_base
-from agent.supervisor import build_supervisor, run_supervisor, stream_supervisor
+from agent.onco_agent import build_agent, stream_agent
 from agent.cache import cache_size, clear_cache
 
 # ---------------------------------------------------------------------------
-# API Key Setup
+# API Key
 # ---------------------------------------------------------------------------
-# Check environment variable first (Docker/EC2 sets this via docker-compose).
-# Fall back to .streamlit/secrets.toml for local development.
 
 api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
@@ -42,306 +25,232 @@ if not api_key:
         )
         st.stop()
 
-# Set the key in the environment so the agent and tool modules can read it
-# with os.getenv() without needing to pass it around explicitly.
 os.environ["GEMINI_API_KEY"] = api_key
 
 CHROMA_PATH = "chroma_db"
 
-# ---------------------------------------------------------------------------
-# Cached resource: Agent
-# ---------------------------------------------------------------------------
-# build_agent() loads the LLM, registers all tools, and compiles the
-# LangGraph state machine. This is expensive so we cache it once per
-# Streamlit process using @st.cache_resource.
 
 @st.cache_resource
 def load_agent():
-    """
-    Load and compile the 5-role multi-agent supervisor graph.
-
-    Returns the compiled graph, or stops the app if the API key is missing.
-    The agents handle missing knowledge base gracefully via the RAG tool.
-    """
     try:
-        return build_supervisor()
+        return build_agent()
     except EnvironmentError as e:
         st.error(str(e))
         st.stop()
 
-# ---------------------------------------------------------------------------
-# Background Updater
-# ---------------------------------------------------------------------------
-# APScheduler runs update_knowledge_base() every 30 minutes in a background
-# thread. It checks file modification times (mtime) and only re-indexes
-# files that changed. This matches the behavior from the original app.
 
 def _start_scheduler():
-    """
-    Start the APScheduler background job to re-index the knowledge base
-    every 30 minutes. Guards against being started more than once in the
-    same Streamlit session.
-
-    Also triggers an immediate indexing run in a background thread so that
-    a fresh deployment doesn't serve empty RAG results for the first 30 min.
-    """
     if not st.session_state.get("scheduler_started", False):
         import threading
-        # Run initial indexing immediately (non-blocking) so docs are available
-        # from the very first user query, not 30 minutes after startup.
         threading.Thread(target=update_knowledge_base, daemon=True).start()
         scheduler = BackgroundScheduler()
         scheduler.add_job(update_knowledge_base, "interval", minutes=30)
         scheduler.start()
         st.session_state["scheduler_started"] = True
 
-# ---------------------------------------------------------------------------
-# Page Config
-# ---------------------------------------------------------------------------
 
 st.set_page_config(
-    layout="wide",
     page_title="OncoBot AI",
-    page_icon="ribbon"
+    page_icon="ribbon",
+    layout="centered",
 )
 
-st.title("OncoBot: Intelligent Cancer Research Assistant")
-st.caption(
-    "Specialized in Oncology, Treatment Pathways, and Patient Support. "
-    "Not a replacement for a doctor."
-)
-
-# Run the scheduler and load the agent on every page load.
-# Both are guarded against re-initialization.
 _start_scheduler()
 agent_graph = load_agent()
 
-# ---------------------------------------------------------------------------
-# Session State Initialization
-# ---------------------------------------------------------------------------
-# Each browser session gets a unique thread_id. LangGraph uses this to
-# store and retrieve the conversation history from the MemorySaver checkpointer.
-# This means the agent remembers what was said earlier in the same session.
-
 if "thread_id" not in st.session_state:
     st.session_state["thread_id"] = str(uuid.uuid4())
-
 if "messages" not in st.session_state:
-    # Chat history for the Streamlit UI display (role + content pairs).
     st.session_state["messages"] = []
-
 if "last_graph_dot" not in st.session_state:
-    # Stores the most recent Graphviz DOT string for the visualization panel.
     st.session_state["last_graph_dot"] = None
-
 if "last_reasoning_steps" not in st.session_state:
-    # Stores the agent's reasoning steps from the last turn for the
-    # transparency panel (collapsible expander in the right column).
     st.session_state["last_reasoning_steps"] = []
-
 if "last_tools_used" not in st.session_state:
-    # List of tool names called in the last turn, shown as badges in the UI.
     st.session_state["last_tools_used"] = []
 
 # ---------------------------------------------------------------------------
-# Sidebar
+# Sidebar — minimal: uploads + developer tools tucked away
 # ---------------------------------------------------------------------------
 
-st.sidebar.header("Patient / Researcher Tools")
-
+st.sidebar.markdown("### Upload Files")
 uploaded_file = st.sidebar.file_uploader(
-    "Upload Scan or Diagram (Research Use Only)",
-    type=["jpg", "jpeg", "png"]
+    "Medical image (scan, dermoscopy, diagram)",
+    type=["jpg", "jpeg", "png"],
+    label_visibility="collapsed",
+    help="Upload a breast ultrasound, skin lesion, or other medical image for AI analysis.",
 )
-
 if uploaded_file:
-    st.sidebar.image(
-        uploaded_file,
-        caption="Image will be analyzed by the agent.",
-        use_container_width=True
-    )
-    # Reset the file pointer after preview so we can read it again later.
+    st.sidebar.image(uploaded_file, use_container_width=True)
     uploaded_file.seek(0)
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Session ID**")
-st.sidebar.code(st.session_state["thread_id"][:8] + "...", language=None)
+uploaded_csv = st.sidebar.file_uploader(
+    "Gene expression CSV",
+    type=["csv"],
+    label_visibility="collapsed",
+    help="Upload a CSV of gene expression features for cancer type classification (OncoTypeBC).",
+)
+if uploaded_csv:
+    st.sidebar.success(f"{uploaded_csv.name} loaded", icon="\u2705")
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("**Response Cache**")
-st.sidebar.caption(
-    f"{cache_size()} response(s) cached. "
-    "Cached answers are served instantly without using API quota."
-)
-if st.sidebar.button("Clear response cache"):
-    deleted = clear_cache()
-    st.sidebar.success(f"Cleared {deleted} cached response(s).")
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Response Quality (RAGAS)**")
-st.sidebar.caption(
-    "Measures faithfulness and answer relevance against the RAG context. "
-    "Uses Gemini as an LLM judge — costs 1-2 extra API requests."
-)
-if st.sidebar.button("Evaluate last response"):
-    _msgs = st.session_state.get("messages", [])
-    _last_q = next((m["content"] for m in reversed(_msgs) if m["role"] == "user"), None)
-    _last_a = next((m["content"] for m in reversed(_msgs) if m["role"] == "assistant"), None)
-    if _last_q and _last_a:
-        with st.sidebar:
+with st.sidebar.expander("Developer Tools", expanded=False):
+    st.caption(f"Session: `{st.session_state['thread_id'][:8]}...`")
+    st.caption(f"Cache: {cache_size()} response(s)")
+    if st.button("Clear cache", use_container_width=True):
+        deleted = clear_cache()
+        st.success(f"Cleared {deleted} response(s).")
+    st.markdown("---")
+    st.caption("**RAGAS Evaluation**")
+    if st.button("Evaluate last response", use_container_width=True):
+        _msgs = st.session_state.get("messages", [])
+        _last_q = next((m["content"] for m in reversed(_msgs) if m["role"] == "user"), None)
+        _last_a = next((m["content"] for m in reversed(_msgs) if m["role"] == "assistant"), None)
+        if _last_q and _last_a:
             with st.spinner("Running RAGAS evaluation..."):
                 from evaluation.ragas_eval import evaluate_last_response
                 _scores = evaluate_last_response(_last_q, _last_a)
-        if "error" in _scores:
-            st.sidebar.warning(f"Evaluation failed: {_scores['error']}")
+            if "error" in _scores:
+                st.warning(f"Evaluation failed: {_scores['error']}")
+            else:
+                cols = st.columns(len(_scores))
+                for col, (_metric, _score) in zip(cols, _scores.items()):
+                    col.metric(
+                        label=_metric.replace("_", " ").title(),
+                        value=f"{_score:.2f}",
+                    )
         else:
-            for _metric, _score in _scores.items():
-                st.sidebar.metric(
-                    label=_metric.replace("_", " ").title(),
-                    value=f"{_score:.3f}",
-                )
-    else:
-        st.sidebar.info("Send a message first to enable evaluation.")
+            st.info("Send a message first.")
 
-st.sidebar.markdown("**Example prompts**")
-st.sidebar.markdown(
-    "- What are the side effects of pembrolizumab?\n"
-    "- Show clinical trials for stage 4 lung cancer\n"
-    "- Visualize the PD-1 checkpoint pathway\n"
-    "- Latest research on CAR-T cell therapy\n"
-    "- I am scared, I was just diagnosed with breast cancer"
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+
+st.markdown(
+    "<h2 style='text-align:center;margin-bottom:0'>OncoBot</h2>"
+    "<p style='text-align:center;color:gray;margin-top:0'>"
+    "AI Cancer Research Assistant &mdash; not a replacement for a doctor.</p>",
+    unsafe_allow_html=True,
 )
 
 # ---------------------------------------------------------------------------
-# Main Layout: Chat (left) | Visualization + Reasoning (right)
+# Example prompt pills (shown only when conversation is empty)
 # ---------------------------------------------------------------------------
 
-col_chat, col_panel = st.columns([3, 2])
+if not st.session_state["messages"]:
+    _examples = [
+        "Side effects of pembrolizumab",
+        "Clinical trials for stage 4 lung cancer",
+        "Visualize the PD-1 checkpoint pathway",
+        "Latest research on CAR-T therapy",
+    ]
+    _cols = st.columns(len(_examples))
+    for _col, _ex in zip(_cols, _examples):
+        if _col.button(_ex, use_container_width=True):
+            st.session_state["_prefill"] = _ex
+            st.rerun()
 
-# --- Left column: Chat ---
-with col_chat:
-    # Replay existing chat history on each render.
-    for msg in st.session_state["messages"]:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+# ---------------------------------------------------------------------------
+# Chat
+# ---------------------------------------------------------------------------
 
-    # The main input box.
-    prompt = st.chat_input(
-        "Ask about immunotherapy, specific carcinomas, clinical trials, or side effects..."
-    )
+for msg in st.session_state["messages"]:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
-    if prompt:
-        # Show the user's message immediately.
-        st.session_state["messages"].append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-        # Prepare the image for the agent if one was uploaded.
-        image_b64 = None
-        if uploaded_file:
-            image_bytes = uploaded_file.getvalue()
-            image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-
-        # Stream the agent response token-by-token so the UI feels fast.
-        with st.chat_message("assistant"):
-            response_placeholder = st.empty()
-            status_placeholder   = st.empty()
-            streamed_text = ""
-            final_result = {
-                "response": "",
-                "graph_dot": None,
-                "steps": [],
-                "tools_used": [],
-                "cache_hit": False,
-            }
-
-            for _event in stream_supervisor(
-                agent_graph=agent_graph,
-                user_message=prompt,
-                thread_id=st.session_state["thread_id"],
-                image_b64=image_b64,
-            ):
-                if _event["type"] == "status":
-                    # Show which node is currently active.
-                    status_placeholder.caption(f"*{_event['content']}*")
-                elif _event["type"] == "token":
-                    # Append token and re-render with a blinking cursor effect.
-                    streamed_text += _event["content"]
-                    response_placeholder.markdown(streamed_text + " ▮")
-                elif _event["type"] == "done":
-                    final_result = _event
-                    status_placeholder.empty()
-
-            # Cache hits deliver the full response inside the 'done' event.
-            response_text = (
-                final_result["response"]
-                if final_result.get("cache_hit")
-                else streamed_text
-            )
-            # Final render without cursor.
-            response_placeholder.markdown(response_text)
-
-            # Show cache hit notice or tools used as inline badges.
-            if final_result.get("cache_hit"):
-                similarity_pct = int(final_result.get("cache_similarity", 1.0) * 100)
-                st.caption(f"Served from cache (similarity: {similarity_pct}%) — no API quota used.")
-            elif final_result.get("tools_used"):
-                tools_str = "  |  ".join(final_result["tools_used"])
-                st.caption(f"Tools used: {tools_str}")
-
-        # Save the assistant response to chat history.
-        st.session_state["messages"].append({
-            "role": "assistant",
-            "content": response_text
-        })
-
-        # Persist data for the right panel.
-        if final_result["graph_dot"]:
-            st.session_state["last_graph_dot"] = final_result["graph_dot"]
-        st.session_state["last_reasoning_steps"] = final_result["steps"]
-        st.session_state["last_tools_used"] = final_result["tools_used"]
-
-# --- Right column: Visualization + Reasoning Panel ---
-with col_panel:
-
-    # Section 1: Biological pathway diagram
-    st.subheader("Biological Pathways")
-    if st.session_state["last_graph_dot"]:
+# Show diagram inline after the last assistant message if present
+if st.session_state["last_graph_dot"]:
+    with st.expander("Pathway Diagram", expanded=True):
         st.graphviz_chart(
             st.session_state["last_graph_dot"],
-            use_container_width=True
-        )
-        st.caption("Diagram generated from the agent's response.")
-    else:
-        st.info(
-            "No diagram yet. Try asking:\n"
-            "- Visualize the metastasis pathway\n"
-            "- Show a diagram of T-cell activation\n"
-            "- Map the side effects of chemotherapy"
+            use_container_width=True,
         )
 
-    st.markdown("---")
+# Show reasoning inline after the last assistant message if present
+if st.session_state["last_reasoning_steps"]:
+    with st.expander("Agent Reasoning", expanded=False):
+        for i, step in enumerate(st.session_state["last_reasoning_steps"], start=1):
+            step_type = step["type"]
+            step_content = step["content"]
+            label = {"tool_call": "Tool Call", "observation": "Observation", "agent_response": "Response"}.get(step_type, step_type)
+            st.markdown(f"**Step {i}: {label}**")
+            st.code(step_content, language="text")
 
-    # Section 2: Agent reasoning transparency
-    # This shows the user exactly how the agent arrived at its answer:
-    # which tools it called, what arguments it passed, and what they returned.
-    st.subheader("Agent Reasoning")
-    if st.session_state["last_reasoning_steps"]:
-        with st.expander("Show reasoning steps", expanded=False):
-            for i, step in enumerate(st.session_state["last_reasoning_steps"], start=1):
-                step_type = step["type"]
-                step_content = step["content"]
+# ---------------------------------------------------------------------------
+# Chat input
+# ---------------------------------------------------------------------------
 
-                if step_type == "tool_call":
-                    st.markdown(f"**Step {i}: Tool Call**")
-                    st.code(step_content, language="text")
-                elif step_type == "observation":
-                    st.markdown(f"**Step {i}: Observation**")
-                    st.code(step_content, language="text")
-                elif step_type == "final_answer":
-                    st.markdown(f"**Step {i}: Final Answer (preview)**")
-                    st.code(step_content, language="text")
+_prefill = st.session_state.pop("_prefill", None)
+prompt = st.chat_input(
+    "Ask about cancer types, treatments, clinical trials, or upload an image..."
+)
+if _prefill:
+    prompt = _prefill
 
-                st.markdown("---")
-    else:
-        st.info("Agent reasoning steps will appear here after you send a message.")
+if prompt:
+    st.session_state["messages"].append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    image_b64 = None
+    if uploaded_file:
+        image_bytes = uploaded_file.getvalue()
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    genomic_csv = None
+    if uploaded_csv:
+        genomic_csv = uploaded_csv.getvalue().decode("utf-8")
+
+    with st.chat_message("assistant"):
+        response_placeholder = st.empty()
+        status_placeholder = st.empty()
+        streamed_text = ""
+        final_result = {
+            "response": "",
+            "graph_dot": None,
+            "steps": [],
+            "tools_used": [],
+            "cache_hit": False,
+        }
+
+        for _event in stream_agent(
+            agent_graph=agent_graph,
+            user_message=prompt,
+            thread_id=st.session_state["thread_id"],
+            image_b64=image_b64,
+            genomic_csv=genomic_csv,
+        ):
+            if _event["type"] == "status":
+                status_placeholder.caption(f"*{_event['content']}*")
+            elif _event["type"] == "token":
+                streamed_text += _event["content"]
+                response_placeholder.markdown(streamed_text + " \u25ae")
+            elif _event["type"] == "done":
+                final_result = _event
+                status_placeholder.empty()
+
+        response_text = (
+            final_result["response"]
+            if final_result.get("cache_hit")
+            else streamed_text
+        )
+        response_placeholder.markdown(response_text)
+
+        if final_result.get("cache_hit"):
+            similarity_pct = int(final_result.get("cache_similarity", 1.0) * 100)
+            st.caption(f"Cached ({similarity_pct}% match) — no API used")
+        elif final_result.get("tools_used"):
+            tools_str = " \u2192 ".join(final_result["tools_used"])
+            st.caption(f"Tools: {tools_str}")
+
+    st.session_state["messages"].append({
+        "role": "assistant",
+        "content": response_text,
+    })
+
+    if final_result["graph_dot"]:
+        st.session_state["last_graph_dot"] = final_result["graph_dot"]
+    st.session_state["last_reasoning_steps"] = final_result["steps"]
+    st.session_state["last_tools_used"] = final_result["tools_used"]
+    st.rerun()

@@ -19,10 +19,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # from the EC2 host, so those are NOT baked into the image.
 COPY . .
 
-# 5. Expose Streamlit's default port and start the app
-EXPOSE 8501
-CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
-
-# 5. Run
 EXPOSE 8501
 CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]

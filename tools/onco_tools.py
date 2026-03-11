@@ -1,16 +1,7 @@
-# tools/onco_tools.py
-#
-# This file wraps the core capabilities of the original OncoBot into
-# LangChain @tool functions. The agent in agent/onco_agent.py imports
-# these and decides when to call them based on the user query.
-#
-# Each tool is a plain Python function decorated with @tool.
-# The docstring is critical -- LangChain uses it as the tool description
-# that the LLM reads to decide whether to call the tool.
+# tools/onco_tools.py — LangChain @tool functions for OncoBot.
 
 import os
 import base64
-from typing import Optional
 
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -18,29 +9,16 @@ from langchain_core.messages import HumanMessage
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 
-# These constants mirror what is set in app.py so there is one source of truth.
-# Paths are anchored to the project root via __file__ so the app works correctly
-# regardless of the working directory (local dev vs Docker vs EC2).
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHROMA_PATH = os.path.join(_PROJECT_ROOT, "chroma_db")
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 GENERATOR_MODEL = "gemini-3.1-flash-lite-preview"
 
-# ---------------------------------------------------------------------------
-# Module-level singletons
-# Only the embedding model is cached — it takes ~2 s to load and never changes.
-# The Chroma vectorstore is intentionally NOT cached so that every tool call
-# opens a fresh connection to the SQLite backing store. This guarantees that
-# documents indexed by update_knowledge_base() in the background thread are
-# always visible, even if indexing happened after the first tool invocation.
-# ---------------------------------------------------------------------------
 _embed_model = None
-
-_COLLECTION_NAME = "langchain"  # Must match the name used in updater.py
+_COLLECTION_NAME = "langchain"
 
 
 def _get_embed_model():
-    """Return (and lazily load) the HuggingFaceEmbeddings singleton."""
     global _embed_model
     if _embed_model is None:
         _embed_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
@@ -48,16 +26,7 @@ def _get_embed_model():
 
 
 def _get_retriever():
-    """
-    Build a ChromaDB retriever fresh on each call.
-
-    Opening a new Chroma object is cheap (re-uses the on-disk SQLite); only
-    the embedding model load is expensive, and that is cached separately.
-    Always building fresh prevents stale in-memory state when documents are
-    added by the background indexer after the first tool call.
-
-    Returns None if the chroma_db directory does not exist yet.
-    """
+    """Build a fresh ChromaDB retriever. Returns None if chroma_db missing."""
     if not os.path.exists(CHROMA_PATH):
         return None
     embeddings = _get_embed_model()
@@ -66,14 +35,8 @@ def _get_retriever():
         embedding_function=embeddings,
         collection_name=_COLLECTION_NAME,
     )
-    # k=6 gives the agent slightly more context; no score threshold so all
-    # top-k results are returned regardless of similarity score.
     return vector_store.as_retriever(search_kwargs={"k": 6})
 
-
-# ---------------------------------------------------------------------------
-# Tool 1: RAG Search
-# ---------------------------------------------------------------------------
 
 @tool
 def oncology_rag_search(query: str) -> str:
@@ -127,7 +90,6 @@ def oncology_rag_search(query: str) -> str:
             "Try rephrasing, or use fetch_pubmed_abstracts for a live literature search."
         )
 
-    # Format each retrieved chunk with its source so the LLM can cite it.
     results = []
     for i, doc in enumerate(docs, start=1):
         source = doc.metadata.get("source", "unknown source")
@@ -136,10 +98,6 @@ def oncology_rag_search(query: str) -> str:
 
     return "\n\n---\n\n".join(results)
 
-
-# ---------------------------------------------------------------------------
-# Tool 2: Medical Image Analysis (Vision)
-# ---------------------------------------------------------------------------
 
 @tool
 def analyze_medical_image(question: str, image_b64: str) -> str:
@@ -187,10 +145,6 @@ def analyze_medical_image(question: str, image_b64: str) -> str:
     except Exception as e:
         return f"Image analysis failed: {str(e)}"
 
-
-# ---------------------------------------------------------------------------
-# Tool 3: Biological Pathway Diagram Generation
-# ---------------------------------------------------------------------------
 
 @tool
 def generate_pathway_diagram(topic: str) -> str:
@@ -254,4 +208,338 @@ Topic: {topic}
         return f"Diagram generation failed: {str(e)}"
 
 
+_ONCOSCANBC_MODEL = None
+_ONCOSCANBC_MODEL_PATH = os.path.join(_PROJECT_ROOT, "models", "oncoscan_bc.pth")
+_ONCOSCANBC_CLASSES = ["benign", "malignant", "normal"]
+
+
+def _load_oncoscanbc_model():
+    """Lazily load the OncoScanBC MobileNetV2 model."""
+    global _ONCOSCANBC_MODEL
+    if _ONCOSCANBC_MODEL is not None:
+        return _ONCOSCANBC_MODEL
+
+    if not os.path.exists(_ONCOSCANBC_MODEL_PATH):
+        return None
+
+    import torch
+    from torchvision import models
+
+    model = models.mobilenet_v2(weights=None)
+    model.classifier[1] = torch.nn.Linear(
+        model.last_channel, len(_ONCOSCANBC_CLASSES)
+    )
+    model.load_state_dict(
+        torch.load(_ONCOSCANBC_MODEL_PATH, map_location="cpu", weights_only=True)
+    )
+    model.eval()
+    _ONCOSCANBC_MODEL = model
+    return _ONCOSCANBC_MODEL
+
+
+def _preprocess_image_b64(image_b64: str):
+    """Decode a base64 image and apply standard ImageNet preprocessing."""
+    import io
+    from PIL import Image
+    from torchvision import transforms
+
+    image_bytes = base64.b64decode(image_b64)
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        ),
+    ])
+    return transform(image).unsqueeze(0)  # Add batch dimension
+
+
+@tool
+def classify_breast_ultrasound(image_b64: str) -> str:
+    """
+    Classify a breast ultrasound image as benign, malignant, or normal
+    using the OncoScanBC MobileNetV2 deep learning model.
+
+    Use this tool ONLY when the user has uploaded a breast ultrasound
+    image and wants a classification or diagnosis prediction.
+
+    This is a trained CNN classifier — it returns a predicted class and
+    confidence score, NOT a free-text description. For general image
+    analysis or non-ultrasound images, use analyze_medical_image instead.
+
+    Args:
+        image_b64: The base64-encoded image bytes as a string.
+
+    Returns:
+        A string reporting the predicted class and confidence percentage.
+    """
+    model = _load_oncoscanbc_model()
+    if model is None:
+        return (
+            "OncoScanBC model is not available. "
+            "Place the trained weights at: models/oncoscanbc_mobilenetv2.pth"
+        )
+
+    import torch
+
+    tensor = _preprocess_image_b64(image_b64)
+    with torch.no_grad():
+        outputs = model(tensor)
+        probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
+        confidence, predicted = torch.max(probabilities, 0)
+
+    label = _ONCOSCANBC_CLASSES[predicted.item()]
+    conf_pct = confidence.item() * 100
+
+    return (
+        f"OncoScanBC Prediction: {label.upper()}\n"
+        f"Confidence: {conf_pct:.1f}%\n\n"
+        f"Class probabilities:\n"
+        + "\n".join(
+            f"  - {cls}: {probabilities[i].item()*100:.1f}%"
+            for i, cls in enumerate(_ONCOSCANBC_CLASSES)
+        )
+        + "\n\nNote: This is an AI prediction for research purposes only. "
+        "Clinical diagnosis requires histopathological confirmation."
+    )
+
+
+_ONCOSCANSKIN_MODEL = None
+_ONCOSCANSKIN_MODEL_PATH = os.path.join(_PROJECT_ROOT, "models", "oncoscan_skin.pth")
+_ONCOSCANSKIN_CLASSES = [
+    "actinic keratoses", "basal cell carcinoma", "benign keratosis-like lesions",
+    "dermatofibroma", "melanoma", "melanocytic nevi", "vascular lesions",
+]
+
+
+def _load_oncoscanskin_model():
+    """Lazily load the OncoScanSkin MobileNetV2 model."""
+    global _ONCOSCANSKIN_MODEL
+    if _ONCOSCANSKIN_MODEL is not None:
+        return _ONCOSCANSKIN_MODEL
+
+    if not os.path.exists(_ONCOSCANSKIN_MODEL_PATH):
+        return None
+
+    import torch
+    from torchvision import models
+
+    model = models.mobilenet_v2(weights=None)
+    model.classifier[1] = torch.nn.Linear(
+        model.last_channel, len(_ONCOSCANSKIN_CLASSES)
+    )
+    model.load_state_dict(
+        torch.load(_ONCOSCANSKIN_MODEL_PATH, map_location="cpu", weights_only=True)
+    )
+    model.eval()
+    _ONCOSCANSKIN_MODEL = model
+    return _ONCOSCANSKIN_MODEL
+
+
+@tool
+def classify_skin_lesion(image_b64: str) -> str:
+    """
+    Classify a cutaneous (skin) lesion from a dermoscopy or microscopy
+    image using the OncoScanSkin MobileNetV2 deep learning model.
+
+    Use this tool ONLY when the user has uploaded a skin lesion image
+    and wants a classification or melanoma screening prediction.
+
+    Supported classes: actinic keratoses, basal cell carcinoma,
+    benign keratosis-like lesions, dermatofibroma, melanoma,
+    melanocytic nevi, vascular lesions.
+
+    Args:
+        image_b64: The base64-encoded image bytes as a string.
+
+    Returns:
+        A string reporting the predicted class and confidence percentage.
+    """
+    model = _load_oncoscanskin_model()
+    if model is None:
+        return (
+            "OncoScanSkin model is not available. "
+            "Place the trained weights at: models/oncoscanskin_mobilenetv2.pth"
+        )
+
+    import torch
+
+    tensor = _preprocess_image_b64(image_b64)
+    with torch.no_grad():
+        outputs = model(tensor)
+        probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
+        confidence, predicted = torch.max(probabilities, 0)
+
+    label = _ONCOSCANSKIN_CLASSES[predicted.item()]
+    conf_pct = confidence.item() * 100
+
+    top3 = torch.topk(probabilities, k=min(3, len(_ONCOSCANSKIN_CLASSES)))
+    top3_lines = [
+        f"  - {_ONCOSCANSKIN_CLASSES[idx.item()]}: {prob.item()*100:.1f}%"
+        for prob, idx in zip(top3.values, top3.indices)
+    ]
+
+    return (
+        f"OncoScanSkin Prediction: {label.upper()}\n"
+        f"Confidence: {conf_pct:.1f}%\n\n"
+        f"Top 3 predictions:\n"
+        + "\n".join(top3_lines)
+        + "\n\nNote: This is an AI prediction for research purposes only. "
+        "Clinical diagnosis requires histopathological confirmation."
+    )
+
+
+_ONCOTYPEBC_MODEL = None
+_ONCOTYPEBC_SCALER = None
+_ONCOTYPEBC_LABEL_ENCODER = None
+_ONCOTYPEBC_MODEL_PATH = os.path.join(_PROJECT_ROOT, "models", "oncotype_bc.pth")
+_ONCOTYPEBC_SCALER_PATH = os.path.join(_PROJECT_ROOT, "models", "scaler.pkl")
+_ONCOTYPEBC_ENCODER_PATH = os.path.join(_PROJECT_ROOT, "models", "label_ecoder.pkl")
+
+# Readable names for TCGA cancer type codes.
+_ONCOTYPEBC_CANCER_NAMES = {
+    "BRCA": "Breast Invasive Carcinoma",
+    "KIRC": "Kidney Renal Clear Cell Carcinoma",
+    "LUAD": "Lung Adenocarcinoma",
+    "PRAD": "Prostate Adenocarcinoma",
+    "COAD": "Colon Adenocarcinoma",
+}
+
+
+def _load_oncotypebc_model():
+    """Lazily load OncoTypeBC model, scaler, and label encoder."""
+    global _ONCOTYPEBC_MODEL, _ONCOTYPEBC_SCALER, _ONCOTYPEBC_LABEL_ENCODER
+    if _ONCOTYPEBC_MODEL is not None:
+        return _ONCOTYPEBC_MODEL, _ONCOTYPEBC_SCALER, _ONCOTYPEBC_LABEL_ENCODER
+
+    if not os.path.exists(_ONCOTYPEBC_MODEL_PATH):
+        return None, None, None
+
+    import sys
+    import pickle
+    import torch
+    import torch.nn as nn
+
+    # Model class must be available for torch.load (pickle expects __main__.OncoTypeBCModel).
+    class OncoTypeBCModel(nn.Module):
+        def __init__(self, input_dim):
+            super().__init__()
+            self.network = nn.Sequential(
+                nn.Linear(input_dim, 512),
+                nn.BatchNorm1d(512),
+                nn.ReLU(),
+                nn.Dropout(0.5),
+                nn.Linear(512, 128),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(128, 5),
+            )
+
+        def forward(self, x):
+            return self.network(x)
+
+    sys.modules["__main__"].OncoTypeBCModel = OncoTypeBCModel
+
+    _ONCOTYPEBC_MODEL = torch.load(
+        _ONCOTYPEBC_MODEL_PATH, map_location="cpu", weights_only=False
+    )
+    _ONCOTYPEBC_MODEL.eval()
+
+    if os.path.exists(_ONCOTYPEBC_SCALER_PATH):
+        with open(_ONCOTYPEBC_SCALER_PATH, "rb") as f:
+            _ONCOTYPEBC_SCALER = pickle.load(f)
+
+    if os.path.exists(_ONCOTYPEBC_ENCODER_PATH):
+        with open(_ONCOTYPEBC_ENCODER_PATH, "rb") as f:
+            _ONCOTYPEBC_LABEL_ENCODER = pickle.load(f)
+
+    return _ONCOTYPEBC_MODEL, _ONCOTYPEBC_SCALER, _ONCOTYPEBC_LABEL_ENCODER
+
+
+@tool
+def classify_cancer_type(genomic_csv: str) -> str:
+    """
+    Classify cancer type from gene expression data using the OncoTypeBC
+    deep learning model trained on TCGA RNA-Seq data.
+
+    Use this tool ONLY when the user provides genomic or gene expression
+    data as a CSV string and wants a cancer type prediction.
+
+    The five predicted cancer types are:
+    - BRCA (Breast Invasive Carcinoma)
+    - KIRC (Kidney Renal Clear Cell Carcinoma)
+    - LUAD (Lung Adenocarcinoma)
+    - PRAD (Prostate Adenocarcinoma)
+    - COAD (Colon Adenocarcinoma)
+
+    Args:
+        genomic_csv: A CSV string with gene expression features.
+                     First row must be headers. One sample per row.
+
+    Returns:
+        A string reporting the predicted cancer type and confidence.
+    """
+    model, scaler, label_encoder = _load_oncotypebc_model()
+    if model is None:
+        return (
+            "OncoTypeBC model is not available. "
+            "Place the trained model at: models/oncotype_bc.pth"
+        )
+
+    import io
+    import csv
+    import torch
+
+    reader = csv.reader(io.StringIO(genomic_csv))
+    rows = list(reader)
+    if len(rows) < 2:
+        return "Invalid CSV: need at least a header row and one data row."
+
+    headers = rows[0]
+    try:
+        features = [float(v) for v in rows[1]]
+    except ValueError:
+        return "Invalid CSV: all data values must be numeric."
+
+    if scaler is not None:
+        features_scaled = scaler.transform([features])
+        tensor = torch.tensor(features_scaled, dtype=torch.float32)
+    else:
+        tensor = torch.tensor([features], dtype=torch.float32)
+
+    with torch.no_grad():
+        outputs = model(tensor)
+        probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
+        confidence, predicted = torch.max(probabilities, 0)
+
+    if label_encoder is not None:
+        label_code = label_encoder.inverse_transform([predicted.item()])[0]
+        label = _ONCOTYPEBC_CANCER_NAMES.get(label_code, label_code)
+    else:
+        label = f"Class {predicted.item()}"
+
+    prob_lines = []
+    for i in range(len(probabilities)):
+        if label_encoder is not None:
+            code = label_encoder.inverse_transform([i])[0]
+            name = _ONCOTYPEBC_CANCER_NAMES.get(code, code)
+        else:
+            name = f"Class {i}"
+        prob_lines.append(f"  - {name}: {probabilities[i].item()*100:.1f}%")
+
+    conf_pct = confidence.item() * 100
+
+    return (
+        f"OncoTypeBC Prediction: {label}\n"
+        f"Confidence: {conf_pct:.1f}%\n\n"
+        f"Cancer type probabilities:\n"
+        + "\n".join(prob_lines)
+        + f"\n\nInput features: {len(headers)} columns detected."
+        + "\n\nNote: This is an AI prediction for research purposes only. "
+        "Clinical diagnosis requires histopathological and genomic confirmation."
+    )
 

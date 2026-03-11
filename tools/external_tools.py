@@ -1,17 +1,5 @@
-# tools/external_tools.py
-#
-# This file contains tools that reach out to external APIs to give the
-# agent access to live, up-to-date information beyond the local knowledge base.
-#
-# APIs used (all free, no authentication needed):
-#   - ClinicalTrials.gov REST API v2  (https://clinicaltrials.gov/api/v2)
-#   - NCBI PubMed E-utilities         (https://eutils.ncbi.nlm.nih.gov)
-#   - arXiv API                       (already available via the arxiv package)
-#
-# None of these require an API key for basic usage, which means they work
-# in the Docker container on EC2 without any additional secrets.
+# tools/external_tools.py — External API tools (ClinicalTrials.gov, PubMed, arXiv).
 
-import os
 import json
 import urllib.request
 import urllib.parse
@@ -20,10 +8,6 @@ import xml.etree.ElementTree as ET
 import arxiv
 from langchain_core.tools import tool
 
-
-# ---------------------------------------------------------------------------
-# Tool 5: ClinicalTrials.gov Search
-# ---------------------------------------------------------------------------
 
 @tool
 def search_clinical_trials(condition: str, phase: str = "") -> str:
@@ -48,8 +32,6 @@ def search_clinical_trials(condition: str, phase: str = "") -> str:
         their title, status, phase, and ClinicalTrials.gov identifier (NCT ID).
         Returns an error message if the API call fails.
     """
-    # ClinicalTrials.gov v2 REST API endpoint.
-    # We request only the fields we actually display to keep the response small.
     base_url = "https://clinicaltrials.gov/api/v2/studies"
 
     params = {
@@ -60,7 +42,6 @@ def search_clinical_trials(condition: str, phase: str = "") -> str:
         "format": "json",
     }
 
-    # Only add phase filter if the caller provided one.
     if phase:
         params["filter.phase"] = f"PHASE{phase}"
 
@@ -82,7 +63,6 @@ def search_clinical_trials(condition: str, phase: str = "") -> str:
     results = [f"Clinical trials found for '{condition}':\n"]
 
     for study in studies:
-        # The v2 API nests fields under protocolSection
         protocol = study.get("protocolSection", {})
         id_module = protocol.get("identificationModule", {})
         status_module = protocol.get("statusModule", {})
@@ -96,7 +76,6 @@ def search_clinical_trials(condition: str, phase: str = "") -> str:
         phase_str = ", ".join(phases) if phases else "N/A"
         summary = desc_module.get("briefSummary", "No summary available.")
 
-        # Truncate long summaries
         if len(summary) > 250:
             summary = summary[:250] + "..."
 
@@ -110,10 +89,6 @@ def search_clinical_trials(condition: str, phase: str = "") -> str:
 
     return "\n".join(results)
 
-
-# ---------------------------------------------------------------------------
-# Tool 6: PubMed Abstract Fetch
-# ---------------------------------------------------------------------------
 
 @tool
 def fetch_pubmed_abstracts(query: str) -> str:
@@ -141,7 +116,6 @@ def fetch_pubmed_abstracts(query: str) -> str:
     """
     base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 
-    # Step 1: Search for paper IDs matching the query.
     search_params = urllib.parse.urlencode({
         "db": "pubmed",
         "term": query,
@@ -161,7 +135,6 @@ def fetch_pubmed_abstracts(query: str) -> str:
     if not id_list:
         return f"No PubMed results found for: {query}"
 
-    # Step 2: Fetch the actual abstracts for those IDs.
     fetch_params = urllib.parse.urlencode({
         "db": "pubmed",
         "id": ",".join(id_list),
@@ -176,7 +149,6 @@ def fetch_pubmed_abstracts(query: str) -> str:
     except Exception as e:
         return f"PubMed abstract fetch failed: {str(e)}"
 
-    # Step 3: Parse the XML response to extract title and abstract text.
     try:
         root = ET.fromstring(xml_data)
     except ET.ParseError as e:
@@ -185,11 +157,9 @@ def fetch_pubmed_abstracts(query: str) -> str:
     results = [f"PubMed abstracts for '{query}':\n"]
 
     for article in root.findall(".//PubmedArticle"):
-        # Title
         title_el = article.find(".//ArticleTitle")
         title = title_el.text if title_el is not None else "No title"
 
-        # Abstract text (may have multiple AbstractText sections)
         abstract_parts = article.findall(".//AbstractText")
         if abstract_parts:
             abstract = " ".join(
@@ -198,11 +168,9 @@ def fetch_pubmed_abstracts(query: str) -> str:
         else:
             abstract = "Abstract not available."
 
-        # Truncate long abstracts
         if len(abstract) > 400:
             abstract = abstract[:400] + "..."
 
-        # Publication year
         year_el = article.find(".//PubDate/Year")
         year = year_el.text if year_el is not None else "Unknown year"
 
@@ -216,10 +184,6 @@ def fetch_pubmed_abstracts(query: str) -> str:
 
     return "\n".join(results)
 
-
-# ---------------------------------------------------------------------------
-# Tool 7: arXiv Paper Summarizer
-# ---------------------------------------------------------------------------
 
 @tool
 def summarize_arxiv_paper(arxiv_id: str) -> str:
@@ -245,7 +209,6 @@ def summarize_arxiv_paper(arxiv_id: str) -> str:
         A formatted string with the paper's title, authors, abstract,
         and a direct link to the paper.
     """
-    # Strip common prefixes and version suffixes.
     clean_id = arxiv_id.strip()
     if clean_id.lower().startswith("arxiv:"):
         clean_id = clean_id[6:]
