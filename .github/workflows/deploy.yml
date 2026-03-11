@@ -75,8 +75,10 @@ jobs:
           echo "ECR_REPOSITORY=${{ secrets.ECR_REPOSITORY }}" >> .env
 
           # 3. NUKE THE OLD CONTAINER & IMAGE (Crucial Step)
-          docker compose down || true
-          docker system prune -a -f  # Deletes all unused images to force a fresh download
+          docker compose down --volumes || true
+          docker system prune -a -f --volumes  # Deletes all unused images, volumes to free disk space
+          docker builder prune -a -f  # Clears build cache to reclaim additional disk space
+          df -h  # Log available disk space before pulling new image
 
           # 4. Pull and Start
           docker compose pull
