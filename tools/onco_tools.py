@@ -14,6 +14,18 @@ CHROMA_PATH = os.path.join(_PROJECT_ROOT, "chroma_db")
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 GENERATOR_MODEL = "gemini-3.1-flash-lite-preview"
 
+
+def _extract_text(content) -> str:
+    """Safely extract a plain string from an LLM response content (str or list)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in content
+        )
+    return str(content) if content else ""
+
 # ---------------------------------------------------------------------------
 # Session-level shared state for uploaded data (image / CSV).
 # Tools read from these instead of receiving raw data through LLM tool args,
@@ -165,7 +177,7 @@ def analyze_medical_image(question: str) -> str:
 
     try:
         response = vision_llm.invoke([message])
-        return response.content
+        return _extract_text(response.content)
     except Exception as e:
         return f"Image analysis failed: {str(e)}"
 
@@ -217,7 +229,7 @@ Topic: {topic}
 
     try:
         response = llm.invoke(diagram_prompt)
-        dot_content = response.content.strip()
+        dot_content = _extract_text(response.content).strip()
 
         # Strip markdown code fences if the model added them anyway.
         if "```" in dot_content:
