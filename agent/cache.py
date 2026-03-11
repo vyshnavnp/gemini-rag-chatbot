@@ -72,7 +72,6 @@ def get_cached_response(query: str) -> Optional[dict]:
         metadata = results["metadatas"][0][0]
         return {
             "response": results["documents"][0][0],
-            "graph_dot": metadata.get("graph_dot") or None,
             "steps": [],        # Steps are not cached; they belong to live runs.
             "tools_used": json.loads(metadata.get("tools_used", "[]")),
             "cache_hit": True,
@@ -99,7 +98,6 @@ def store_response(query: str, result: dict) -> None:
         "api daily quota has been reached",
         "agent encountered an error",
         "image analysis failed",
-        "diagram generation failed",
     )
     if any(phrase in response_lower for phrase in _BAD_PHRASES):
         return
@@ -112,7 +110,6 @@ def store_response(query: str, result: dict) -> None:
         embedding = _query_embedding(query)
 
         metadata = {
-            "graph_dot": result.get("graph_dot") or "",
             "tools_used": json.dumps(result.get("tools_used", [])),
         }
 

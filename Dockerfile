@@ -1,8 +1,7 @@
 FROM python:3.11-slim
 
-# 1. Install System Dependencies (Required for Graphviz and ChromaDB)
+# 1. Install System Dependencies (Required for ChromaDB native build)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    graphviz \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 

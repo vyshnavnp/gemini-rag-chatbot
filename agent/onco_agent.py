@@ -14,7 +14,6 @@ from typing_extensions import TypedDict
 from tools.onco_tools import (
     oncology_rag_search,
     analyze_medical_image,
-    generate_pathway_diagram,
     classify_breast_ultrasound,
     classify_skin_lesion,
     classify_cancer_type,
@@ -42,8 +41,6 @@ TOOLS — use the docstrings to decide which to call:
 - fetch_pubmed_abstracts:           Call when user asks for "latest" or "recent" research.
 - search_clinical_trials:           Call for clinical trial queries.
 - summarize_arxiv_paper:            Call when user mentions a specific arXiv paper ID.
-- generate_pathway_diagram:         Call for visual diagrams or flowcharts. Wrap DOT
-                                    output in triple backticks: ```dot ... ```
 - analyze_medical_image:            General image analysis with Gemini Vision.
                                     The uploaded image is accessed automatically.
 - classify_breast_ultrasound:       Breast ultrasound image → benign/malignant/normal.
@@ -117,7 +114,6 @@ def build_agent():
         oncology_rag_search,
         fetch_pubmed_abstracts,
         search_clinical_trials,
-        generate_pathway_diagram,
         analyze_medical_image,
         summarize_arxiv_paper,
         classify_breast_ultrasound,
@@ -178,9 +174,8 @@ def build_agent():
 
 
 def _parse_final_state(final_state) -> dict:
-    """Extract response, steps, tools, and DOT from final LangGraph state."""
+    """Extract response, steps, and tools from final LangGraph state."""
     response_text = ""
-    graph_dot = None
     steps = []
     tools_used = []
 
@@ -207,31 +202,9 @@ def _parse_final_state(final_state) -> dict:
                 "type": "observation",
                 "content": f"Tool '{msg.name}' returned:\n{tool_output}",
             })
-            # Capture DOT directly from generate_pathway_diagram tool output.
-            if msg.name == "generate_pathway_diagram" and msg.content.strip().startswith("digraph"):
-                graph_dot = msg.content.strip()
 
     if not response_text:
         response_text = "I'm sorry, I could not generate a response. Please try again."
-
-    # Extract DOT diagram code if embedded in the response (fallback).
-    if not graph_dot and "```dot" in response_text:
-        parts = response_text.split("```dot")
-        response_text = parts[0].strip()
-        raw_dot = parts[1].split("```")[0].strip()
-        graph_dot = raw_dot
-    elif not graph_dot and "```" in response_text and "digraph" in response_text:
-        parts = response_text.split("```")
-        for i, part in enumerate(parts):
-            if "digraph" in part and part.strip().startswith("digraph"):
-                graph_dot = part.strip()
-                parts[i] = ""
-                response_text = "```".join(parts).strip()
-                break
-    # Strip echoed DOT from response if already captured from tool output.
-    if graph_dot and "```dot" in response_text:
-        parts = response_text.split("```dot")
-        response_text = parts[0].strip()
 
     # Deduplicate tool names while preserving call order.
     seen: set = set()
@@ -243,7 +216,6 @@ def _parse_final_state(final_state) -> dict:
 
     return {
         "response": response_text,
-        "graph_dot": graph_dot,
         "steps": steps,
         "tools_used": unique_tools,
         "cache_hit": False,
@@ -340,7 +312,6 @@ def stream_agent(
     config = make_run_config(thread_id)
 
     full_response = ""
-    graph_dot = None
     steps: list = []
     tools_used: list = []
     status_emitted = False
@@ -371,8 +342,6 @@ def stream_agent(
                                 yield {"type": "status", "content": f"Using {name}..."}
 
                     # Tool results → transparency panel.
-                    # Also capture DOT output from generate_pathway_diagram directly,
-                    # so we don't depend on the LLM echoing it back.
                     if isinstance(msg, ToolMessage):
                         raw = msg.content if isinstance(msg.content, str) else _safe_content(msg.content)
                         tool_output = raw[:300] + "..." if len(raw) > 300 else raw
@@ -380,8 +349,6 @@ def stream_agent(
                             "type": "observation",
                             "content": f"Tool '{msg.name}' returned:\n{tool_output}",
                         })
-                        if msg.name == "generate_pathway_diagram" and raw.strip().startswith("digraph"):
-                            graph_dot = raw.strip()
 
                     # Final AI response (no tool calls = final answer).
                     if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
@@ -423,34 +390,6 @@ def stream_agent(
         full_response = "I'm sorry, I could not generate a response. Please try again."
         yield {"type": "token", "content": full_response}
 
-    # Extract DOT code from response text (if LLM echoed it) as a fallback.
-    # The primary capture happens above when we intercept the tool output.
-    if not graph_dot and "```dot" in full_response:
-        parts = full_response.split("```dot")
-        full_response = parts[0].strip()
-        raw_dot = parts[1].split("```")[0].strip()
-        graph_dot = raw_dot
-    elif not graph_dot and "```" in full_response and "digraph" in full_response:
-        # LLM used generic ``` fences without the "dot" language hint
-        parts = full_response.split("```")
-        for i, part in enumerate(parts):
-            if "digraph" in part:
-                candidate = part.strip()
-                if candidate.startswith("digraph"):
-                    graph_dot = candidate
-                    # Remove the DOT block from the displayed response
-                    parts[i] = ""
-                    full_response = "```".join(parts).strip()
-                    break
-    # If DOT was captured from tool output, still strip any echoed DOT from the response text.
-    if graph_dot and "```dot" in full_response:
-        parts = full_response.split("```dot")
-        full_response = parts[0].strip()
-    elif graph_dot and "digraph" in full_response and "```" in full_response:
-        parts = full_response.split("```")
-        cleaned = [p for i, p in enumerate(parts) if "digraph" not in p or i % 2 == 0]
-        full_response = "".join(cleaned).strip()
-
     # Deduplicate tools.
     seen: set = set()
     unique_tools: list = []
@@ -461,7 +400,6 @@ def stream_agent(
 
     result = {
         "response": full_response,
-        "graph_dot": graph_dot,
         "steps": steps,
         "tools_used": unique_tools,
         "cache_hit": False,

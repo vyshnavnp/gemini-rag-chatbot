@@ -182,68 +182,6 @@ def analyze_medical_image(question: str) -> str:
         return f"Image analysis failed: {str(e)}"
 
 
-@tool
-def generate_pathway_diagram(topic: str) -> str:
-    """
-    Generate a Graphviz DOT language diagram for a biological or clinical
-    pathway related to oncology.
-
-    Use this tool when the user asks to:
-    - visualize a pathway (e.g., "show me the metastasis pathway")
-    - draw a diagram (e.g., "diagram of T-cell activation")
-    - map a process (e.g., "map chemotherapy side effects")
-    - show a flowchart of any cancer-related biological process
-
-    The output is a raw Graphviz DOT string. The Streamlit app renders
-    this with st.graphviz_chart(). The diagram uses top-to-bottom layout
-    (rankdir=TB) for readability.
-
-    Args:
-        topic: A plain English description of the pathway or process to
-               visualize (e.g., "PD-1/PD-L1 checkpoint inhibition pathway").
-
-    Returns:
-        A Graphviz DOT format string, or an error message if generation
-        fails. The string does NOT include the triple-backtick fences --
-        just the raw DOT content starting with 'digraph'.
-    """
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        return "GEMINI_API_KEY is not set. Cannot generate diagram."
-
-    llm = ChatGoogleGenerativeAI(model=GENERATOR_MODEL, api_key=api_key)
-
-    diagram_prompt = f"""
-You are a biomedical visualization expert.
-Generate ONLY a valid Graphviz DOT language diagram for the following oncology topic.
-
-Rules:
-- Start with: digraph G {{ rankdir=TB;
-- Use descriptive node labels in double quotes
-- Use -> for directed edges
-- End with }}
-- Output ONLY the DOT code, no explanation, no markdown fences, no extra text
-
-Topic: {topic}
-"""
-
-    try:
-        response = llm.invoke(diagram_prompt)
-        dot_content = _extract_text(response.content).strip()
-
-        # Strip markdown code fences if the model added them anyway.
-        if "```" in dot_content:
-            lines = dot_content.split("\n")
-            dot_content = "\n".join(
-                line for line in lines
-                if not line.strip().startswith("```")
-            )
-
-        return dot_content.strip()
-    except Exception as e:
-        return f"Diagram generation failed: {str(e)}"
-
-
 _ONCOSCANBC_MODEL = None
 _ONCOSCANBC_MODEL_PATH = os.path.join(_PROJECT_ROOT, "models", "oncoscan_bc.pth")
 _ONCOSCANBC_CLASSES = ["benign", "malignant", "normal"]

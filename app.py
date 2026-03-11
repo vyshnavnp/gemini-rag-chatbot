@@ -62,8 +62,6 @@ if "thread_id" not in st.session_state:
     st.session_state["thread_id"] = str(uuid.uuid4())
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
-if "last_graph_dot" not in st.session_state:
-    st.session_state["last_graph_dot"] = None
 if "last_reasoning_steps" not in st.session_state:
     st.session_state["last_reasoning_steps"] = []
 if "last_tools_used" not in st.session_state:
@@ -144,7 +142,7 @@ if not st.session_state["messages"]:
     _examples = [
         "Side effects of pembrolizumab",
         "Clinical trials for stage 4 lung cancer",
-        "Visualize the PD-1 checkpoint pathway",
+        "What is immunotherapy",
         "Latest research on CAR-T therapy",
     ]
     _cols = st.columns(len(_examples))
@@ -160,14 +158,6 @@ if not st.session_state["messages"]:
 for msg in st.session_state["messages"]:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-
-# Show diagram inline after the last assistant message if present
-if st.session_state["last_graph_dot"]:
-    with st.expander("Pathway Diagram", expanded=True):
-        st.graphviz_chart(
-            st.session_state["last_graph_dot"],
-            use_container_width=True,
-        )
 
 # Show reasoning inline after the last assistant message if present
 if st.session_state["last_reasoning_steps"]:
@@ -210,7 +200,6 @@ if prompt:
         streamed_text = ""
         final_result = {
             "response": "",
-            "graph_dot": None,
             "steps": [],
             "tools_used": [],
             "cache_hit": False,
@@ -251,8 +240,6 @@ if prompt:
         "content": response_text,
     })
 
-    if final_result["graph_dot"]:
-        st.session_state["last_graph_dot"] = final_result["graph_dot"]
     st.session_state["last_reasoning_steps"] = final_result["steps"]
     st.session_state["last_tools_used"] = final_result["tools_used"]
     st.rerun()
