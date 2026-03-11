@@ -11,3 +11,11 @@ venv
 # reading from /app/knowledge_base (which IS baked into the image).
 # The chroma_db volume in docker-compose.yml persists it across restarts.
 chroma_db/
+# Training artefacts — not needed at runtime
+notebooks/
+datasets/
+# Misc dev files
+_count_lines.py
+index_metadata.json
+*.md
+!README.md

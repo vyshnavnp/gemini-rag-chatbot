@@ -66,6 +66,23 @@ jobs:
           export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
           export ECR_REGISTRY=${{ secrets.ECR_REGISTRY }}
 
+          # 0. Expand EBS volume if it is smaller than 20 GB
+          INSTANCE_ID=$(ec2metadata --instance-id 2>/dev/null || curl -s http://169.254.169.254/latest/meta-data/instance-id)
+          VOLUME_ID=$(aws ec2 describe-volumes \
+            --filters Name=attachment.instance-id,Values=$INSTANCE_ID \
+            --query 'Volumes[0].VolumeId' --output text)
+          CURRENT_SIZE=$(aws ec2 describe-volumes \
+            --volume-ids $VOLUME_ID \
+            --query 'Volumes[0].Size' --output text)
+          if [ "$CURRENT_SIZE" -lt 20 ]; then
+            echo "Expanding EBS volume $VOLUME_ID from ${CURRENT_SIZE}GB to 20GB..."
+            aws ec2 modify-volume --volume-id $VOLUME_ID --size 20
+            sleep 10
+            # Grow the partition and filesystem
+            sudo growpart /dev/xvda 1 2>/dev/null || sudo growpart /dev/nvme0n1p1 1 2>/dev/null || true
+            sudo resize2fs /dev/xvda1 2>/dev/null || sudo resize2fs /dev/nvme0n1p1 2>/dev/null || true
+          fi
+
           # 1. Login
           aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
 
@@ -76,9 +93,9 @@ jobs:
 
           # 3. NUKE THE OLD CONTAINER & IMAGE (Crucial Step)
           docker compose down --volumes || true
-          docker system prune -a -f --volumes  # Deletes all unused images, volumes to free disk space
-          docker builder prune -a -f  # Clears build cache to reclaim additional disk space
-          df -h  # Log available disk space before pulling new image
+          docker system prune -a -f --volumes
+          docker builder prune -a -f
+          df -h
 
           # 4. Pull and Start
           docker compose pull

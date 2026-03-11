@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
 # 1. Install System Dependencies (Required for Graphviz and ChromaDB)
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     graphviz \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
@@ -11,7 +11,10 @@ WORKDIR /app
 COPY requirements.txt .
 
 # 3. Install Python Libs
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && apt-get purge -y build-essential \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*
 
 # 4. Copy Code
 # The agent/ and tools/ subdirectories are included automatically.
