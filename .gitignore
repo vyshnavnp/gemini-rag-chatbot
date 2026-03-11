@@ -15,9 +15,6 @@ __pycache__/
 # Never commit it -- it changes on every query and has no place in source control.
 chroma_db/
 
-# ML model weights & artefacts (use Git LFS or download at build time)
-models/
-
 # Training notebooks & datasets (not needed at runtime)
 notebooks/
 datasets/
