@@ -17,5 +17,9 @@ services:
       # The XML files are baked into the image via 'COPY . .' in the Dockerfile.
       # Mounting a host directory here would shadow the baked-in files with an
       # empty directory on a fresh EC2 host, causing RAG to stay empty forever.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY}

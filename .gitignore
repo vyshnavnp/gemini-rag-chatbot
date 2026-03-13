@@ -18,6 +18,7 @@ chroma_db/
 # Training notebooks & datasets (not needed at runtime)
 notebooks/
 datasets/
+presentation/
 
 # Local test artefacts
 index_metadata.json

@@ -17,9 +17,15 @@ RUN pip install --no-cache-dir -r requirements.txt \
 
 # 4. Copy Code
 # The agent/ and tools/ subdirectories are included automatically.
-# Volumes in docker-compose.yml mount knowledge_base/ and chroma_db/
-# from the EC2 host, so those are NOT baked into the image.
+# chroma_db/ is excluded via .dockerignore (persisted on EC2 via volume mount).
 COPY . .
+
+# 5. Non-root user (UID 1000 matches the ubuntu user on EC2 so the
+#    bind-mounted chroma_db/ volume remains writable).
+RUN addgroup --system --gid 1000 appuser \
+ && adduser --system --uid 1000 --ingroup appuser appuser \
+ && chown -R appuser:appuser /app
+USER appuser
 
 EXPOSE 8501
 CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]

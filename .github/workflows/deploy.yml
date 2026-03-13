@@ -2,7 +2,7 @@ name: Deploy OncoBot to AWS ECR
 
 on:
   push:
-    branches: ["main", "master"] # Added "master" branch trigger for safety
+    branches: ["main"]
 
 jobs:
   build-and-push:
@@ -24,14 +24,26 @@ jobs:
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v1
 
-    - name: Build, tag, and push image to Amazon ECR
+    - name: Build Docker image
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
         IMAGE_TAG: latest
-      run: |
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+      run: docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+
+    - name: Scan image for critical vulnerabilities
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:latest
+        exit-code: '1'
+        severity: 'CRITICAL'
+
+    - name: Push image to Amazon ECR
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+        IMAGE_TAG: latest
+      run: docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
   deploy:
     name: Deploy to EC2
@@ -91,7 +103,11 @@ jobs:
           echo "ECR_REGISTRY=${{ secrets.ECR_REGISTRY }}" >> .env
           echo "ECR_REPOSITORY=${{ secrets.ECR_REPOSITORY }}" >> .env
 
-          # 3. NUKE THE OLD CONTAINER & IMAGE (Crucial Step)
+          # 3. Ensure the chroma_db volume dir exists and is owned by ubuntu (UID 1000)
+          #    so the non-root container user (appuser, also UID 1000) can write to it.
+          mkdir -p oncobot_data/chroma_db
+
+          # 4. NUKE THE OLD CONTAINER & IMAGE (Crucial Step)
           docker compose down --volumes || true
           docker system prune -a -f --volumes
           docker builder prune -a -f
