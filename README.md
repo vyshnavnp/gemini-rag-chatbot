@@ -124,7 +124,6 @@ gemini_rag_chatbot/
 ├── models/                # PyTorch model weights (.pth, .pkl)
 ├── app.py                 # Streamlit UI (centered layout, chat-focused)
 ├── updater.py             # Incremental knowledge base indexer
-├── test_agent.py          # End-to-end verification script
 ├── requirements.txt
 ├── Dockerfile
 └── docker-compose.yml
@@ -145,7 +144,6 @@ mkdir .streamlit
 echo 'GEMINI_API_KEY = "your-key-here"' > .streamlit/secrets.toml
 
 python updater.py        # Build knowledge base (first time)
-python test_agent.py     # Verify everything works
 streamlit run app.py
 ```
 
