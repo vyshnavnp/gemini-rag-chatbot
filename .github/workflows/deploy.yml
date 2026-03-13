@@ -4,6 +4,10 @@ on:
   push:
     branches: ["main"]
 
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read
+
 jobs:
   build-and-push:
     name: Build & Push to ECR
@@ -13,11 +17,10 @@ jobs:
     - name: Checkout Code
       uses: actions/checkout@v3
 
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v2
+    - name: Configure AWS Credentials (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
       with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
         aws-region: ${{ secrets.AWS_REGION }}
     
     - name: Login to Amazon ECR
@@ -69,13 +72,9 @@ jobs:
         host: ${{ secrets.EC2_HOST }}
         username: ubuntu
         key: ${{ secrets.EC2_SSH_KEY }}
-        # Note: We don't need to pass all these ENVs, but it doesn't hurt.
-        envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_REGION,ECR_REGISTRY,ECR_REPOSITORY,GEMINI_API_KEY
         script: |
           export PATH=$PATH:/snap/bin
           export AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}
-          export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
-          export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
           export ECR_REGISTRY=${{ secrets.ECR_REGISTRY }}
 
           # 0. Expand EBS volume if it is smaller than 20 GB
