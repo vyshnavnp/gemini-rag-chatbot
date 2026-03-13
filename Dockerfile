@@ -23,9 +23,13 @@ COPY . .
 # 5. Non-root user (UID 1000 matches the ubuntu user on EC2 so the
 #    bind-mounted chroma_db/ volume remains writable).
 RUN addgroup --system --gid 1000 appuser \
- && adduser --system --uid 1000 --ingroup appuser appuser \
- && chown -R appuser:appuser /app
+ && adduser --system --uid 1000 --ingroup appuser --home /home/appuser appuser \
+ && mkdir -p /home/appuser/.cache \
+ && chown -R appuser:appuser /app /home/appuser
 USER appuser
+
+# HuggingFace model cache inside the writable home dir
+ENV HF_HOME=/home/appuser/.cache/huggingface
 
 EXPOSE 8501
 CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
