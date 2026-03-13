@@ -22,3 +22,6 @@ presentation/
 
 # Local test artefacts
 index_metadata.json
+
+# test scripts
+test_*.py
