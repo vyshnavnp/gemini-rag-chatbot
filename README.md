@@ -91,16 +91,16 @@ OncoTypeBC also requires `scaler.pkl` (StandardScaler) and `label_ecoder.pkl` (L
 | Layer | Technology |
 |---|---|
 | LLM | Google Gemini 3.1 Flash Lite Preview (500 req/day free tier) |
-| Agent Framework | LangGraph 1.0.10 (single-agent, StateGraph) |
-| Orchestration | LangChain |
+| Agent Framework | LangGraph 1.1.2 (single-agent, StateGraph) |
+| Orchestration | LangChain 1.2.12 |
 | Embeddings | HuggingFace `paraphrase-multilingual-MiniLM-L12-v2` |
-| Vector DB | ChromaDB (RAG collection + response cache collection) |
-| ML Models | PyTorch 2.3.0 (CPU), MobileNetV2, custom MLP |
+| Vector DB | ChromaDB 1.5.5 (RAG collection + response cache collection) |
+| ML Models | PyTorch 2.6.0 CPU (MobileNetV2, custom MLP) |
 | External APIs | ClinicalTrials.gov v2, NCBI PubMed E-utilities, arXiv |
-| App Framework | Streamlit |
-| Containerization | Docker (python:3.11-slim), Docker Compose |
+| App Framework | Streamlit 1.55.0 |
+| Containerization | Docker (python:3.11-slim, non-root), Docker Compose |
 | Cloud | AWS EC2 (t3.medium), AWS ECR |
-| CI/CD | GitHub Actions |
+| CI/CD | GitHub Actions (OIDC auth, Trivy vulnerability scanning) |
 
 ---
 
@@ -157,13 +157,38 @@ Model weights are included in the repo (~60 MB). No extra download step needed.
 
 GitHub Actions (`.github/workflows/deploy.yml`) builds, pushes to ECR, and deploys on every push to `main`.
 
-Required GitHub Actions secrets:
+### CI/CD Pipeline
+
 ```
-AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION,
-ECR_REGISTRY, ECR_REPOSITORY, EC2_HOST, EC2_SSH_KEY, GEMINI_API_KEY
+push to main → Build image → Trivy scan (CRITICAL) → Push to ECR → Deploy to EC2
 ```
 
+- **OIDC authentication** — no static AWS keys stored in GitHub. The runner assumes an IAM role via short-lived tokens.
+- **Trivy vulnerability scan** — blocks the push if any CRITICAL CVE is found in the image.
+- **Non-root container** — runs as `appuser` (UID 1000), with `no-new-privileges` and `cap_drop: ALL`.
+- **EC2 Instance Role** — the EC2 instance uses an IAM instance role for ECR pull and EBS management (no keys on the server).
+
+### Required GitHub Secrets
+
+| Secret | Purpose |
+|---|---|
+| `AWS_ROLE_ARN` | IAM role ARN for OIDC (replaces static keys) |
+| `AWS_REGION` | AWS region |
+| `ECR_REGISTRY` | ECR registry URI |
+| `ECR_REPOSITORY` | ECR repository name |
+| `EC2_HOST` | EC2 public IP/hostname |
+| `EC2_SSH_KEY` | SSH private key for EC2 |
+| `GEMINI_API_KEY` | Google Gemini API key |
+
 First deployment: `docker exec -it oncobot-container python updater.py`
+
+### Security Hardening
+
+- **Dockerfile**: Non-root `appuser` (UID 1000), build dependencies purged after install
+- **Docker Compose**: `security_opt: no-new-privileges`, `cap_drop: ALL`
+- **CI/CD**: OIDC (no long-lived AWS credentials), Trivy image scanning
+- **EC2**: IAM instance role (no static keys on server), EBS auto-expansion
+- **Dependencies**: All packages pinned to exact versions, PyTorch CPU-only build
 
 ---
 
