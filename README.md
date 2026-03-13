@@ -68,7 +68,7 @@ classifier to use.
 - **Multilingual**: `paraphrase-multilingual-MiniLM-L12-v2` embeddings match any language against the English knowledge base.
 - **Multimodal**: Image upload → Gemini Vision analysis or CNN classification.
 - **ML Classification**: OncoScanBC (breast ultrasound, 3 classes), OncoScanSkin (dermoscopy, 7 classes), OncoTypeBC (gene expression → 5 TCGA cancer types).
-- **Auto-updating Knowledge Base**: APScheduler re-indexes `knowledge_base/` every 30 minutes.
+- **Auto-updating Knowledge Base**: APScheduler re-indexes `knowledge_base/` every 30 minutes. Uses SHA-256 content hashing to detect new or modified files — no duplicates across container rebuilds.
 - **LLM-as-Judge Evaluation**: Measures faithfulness and answer relevancy using Gemini as a judge.
 
 ---

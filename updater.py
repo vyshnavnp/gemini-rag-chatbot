@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import hashlib
 import xml.etree.ElementTree as ET
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -14,7 +15,9 @@ from langchain_core.documents import Document
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 CHROMA_PATH = os.path.join(_PROJECT_ROOT, "chroma_db")
 DATA_PATH = os.path.join(_PROJECT_ROOT, "knowledge_base")
-METADATA_FILE = os.path.join(_PROJECT_ROOT, "index_metadata.json")
+# Store metadata inside chroma_db/ so it persists on the bind-mounted volume.
+# This prevents duplicate re-indexing after container rebuilds.
+METADATA_FILE = os.path.join(CHROMA_PATH, "index_metadata.json")
 # Must match _COLLECTION_NAME in tools/onco_tools.py so that the indexer and
 # retriever always read from and write to the same ChromaDB collection.
 COLLECTION_NAME = "langchain"
@@ -33,6 +36,15 @@ def load_metadata():
 def save_metadata(metadata):
     with open(METADATA_FILE, 'w', encoding='utf-8') as f:
         json.dump(metadata, f, indent=4)
+
+def file_hash(filepath):
+    """SHA-256 hash of file contents. Reliable across Docker rebuilds
+    (unlike mtime, which changes on every git checkout / COPY)."""
+    h = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()
 
 def process_pdf(filepath):
     try:
@@ -72,8 +84,8 @@ def update_knowledge_base():
     for filename in os.listdir(DATA_PATH):
         if filename.endswith((".pdf", ".xml")):
             filepath = os.path.join(DATA_PATH, filename)
-            mtime = os.path.getmtime(filepath)
-            if filepath not in indexed_data or (mtime - indexed_data.get(filepath, 0.0)) > 1:
+            fhash = file_hash(filepath)
+            if indexed_data.get(filepath) != fhash:
                 files_to_index.append(filepath)
 
     if not files_to_index:
@@ -90,7 +102,7 @@ def update_knowledge_base():
         chunks = process_pdf(filepath) if filepath.endswith(".pdf") else process_xml(filepath)
         if chunks:
             db.add_documents(chunks)
-            indexed_data[filepath] = os.path.getmtime(filepath)
+            indexed_data[filepath] = file_hash(filepath)
 
     # ChromaDB with PersistentClient auto-persists; no manual persist() needed.
     save_metadata(indexed_data)
