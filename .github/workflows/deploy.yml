@@ -104,6 +104,8 @@ jobs:
 
           # 3. Ensure the chroma_db volume dir exists and is owned by ubuntu (UID 1000)
           #    so the non-root container user (appuser, also UID 1000) can write to it.
+          #    Also wipe stale DB created by pre-1.x chromadb (incompatible format).
+          sudo rm -rf oncobot_data/chroma_db
           mkdir -p oncobot_data/chroma_db
 
           # 4. NUKE THE OLD CONTAINER & IMAGE (Crucial Step)
