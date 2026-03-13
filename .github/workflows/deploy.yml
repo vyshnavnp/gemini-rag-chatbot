@@ -107,12 +107,11 @@ jobs:
           #    so the non-root container user (appuser, also UID 1000) can write to it.
           mkdir -p oncobot_data/chroma_db
 
-          # 4. NUKE THE OLD CONTAINER & IMAGE (Crucial Step)
-          docker compose down --volumes || true
-          docker system prune -a -f --volumes
-          docker builder prune -a -f
+          # 4. Stop old container, pull new image, clean up old images
+          docker compose down || true
+          docker compose pull
+          docker image prune -f
           df -h
 
-          # 4. Pull and Start
-          docker compose pull
+          # 5. Start
           docker compose up -d
